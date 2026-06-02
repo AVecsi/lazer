@@ -40,38 +40,61 @@ To build the lazer C library, from the base directory, run:
 Optional: use make's `-j` option to speed up compilation.
 
 
-Building on Apple Silicon (arm64 macOS) -- experimental
--------------------------------------------------------
-The core C library (liblazer.a / liblazer.so) also builds and runs
-natively on Apple Silicon (arm64) Macs. The x86-64 AVX/AES build is
-unchanged; the build system auto-detects the architecture.
+Building on ARM (Apple Silicon and Android/Termux) -- experimental
+------------------------------------------------------------------
+The library, its Python module, and the demos also build and run
+natively on ARM: Apple Silicon (arm64) Macs and 64-bit Android phones
+via Termux. The x86-64 AVX/AES build is unchanged; the build system
+auto-detects the platform.
 
 Differences from the x86-64 build:
 
 - Intel HEXL is built using its portable non-AVX (native) fallback;
   no AVX acceleration is used on ARM.
 - LaBRADOR is NOT built on ARM (it contains x86-only assembly), so the
-  aggregate-signature demos (python/agg_sig.py, labrador.py) are
-  unavailable. All linear-relation proofs and the other demos work.
+  aggregate-signature demo (python/agg_sig.py) is unavailable. All
+  linear-relation proofs and the other demos (demo, anon_cred,
+  kyber1024, blindsig) work.
 - Falcon is built with its portable native-double FFT (no AVX2/FMA).
+- The pseudorandom generator is SHAKE128 (config.h). On ARM the generic
+  C AES-CTR path is extremely slow, so AES256CTR is not recommended
+  there.
 
-Requirements: Xcode command line tools (Apple clang), make, cmake, and
-the GMP, MPFR and cpu_features libraries from Homebrew. Install the
-native dependencies once with:
+apple silicon (macos):
+  Requirements: Xcode command line tools (Apple clang), make, cmake,
+  and GMP, MPFR and cpu_features from Homebrew:
 
-`brew install gmp mpfr cpu_features`
+    brew install gmp mpfr cpu_features
+    make
+    cd python && make
 
-Then build from the base directory with:
+  No extra environment variables are needed for the build. To run a
+  Python demo, the shared library is located via DYLD_LIBRARY_PATH,
+  e.g. from the repository root:
 
-`make`
+    export DYLD_LIBRARY_PATH=$PWD
+    cd python/demo && python3 demo.py
 
-This produces liblazer.a and liblazer.so. No extra environment
-variables are needed: the Makefile detects arm64 macOS and sets the
-Homebrew include/library paths, the required cmake options for HEXL,
-and the architecture-specific compiler flags. Tested with Apple clang
-14, cmake 4.1 and Homebrew under /opt/homebrew.
+android (termux):
+  Install the toolchain and dependencies, then build:
 
-The Python module on arm64 macOS is not yet supported.
+    pkg install clang make cmake binutils git unzip patch \
+                libgmp libmpfr libffi python
+    pip install cffi
+    make
+    cd python && make
+
+  The HEXL build downloads Google cpu_features from GitHub, so a
+  network connection is required on the first build. On Linux/Android
+  the shared library is found automatically (rpath); no
+  LD_LIBRARY_PATH is needed.
+
+Both were tested on otherwise up-to-date toolchains (Apple clang 14 /
+cmake 4.1; Termux clang 21). After building on a new ARM toolchain it
+is worth running the C tests `tests/int-test` and `tests/poly-test`
+(`make tests/int-test tests/poly-test && ./tests/int-test &&
+./tests/poly-test`): they exercise the multi-precision integer code,
+which is sensitive to aggressive compiler optimization on ARM.
 
 To build lazer's python module, change to the `python` subdirectory and run:
 

@@ -12,35 +12,53 @@ As shipped, the library builds and runs on **Linux x86-64 with AVX2/AVX-512 and 
 
 Toolchain: gcc >= 13.2, make >= 4.2, cmake >= 3.26, sagemath >= 10.2, python3 >= 3.10 (with dev headers + `cffi`).
 
-## ARM port (mobile + Apple Silicon)
+## ARM port (Apple Silicon + Android/Termux)
 
-**Goal:** build and run lazer's core library on ARM (Apple Silicon arm64 macOS, and mobile iOS/Android arm64) while keeping the x86 build working. ARM support is layered on through the existing `TARGET`/OS abstraction, keyed off `__aarch64__`/`__arm__` (C) and `uname -m` (make), with x86-64 unchanged as the default branch.
+**Goal:** build and run lazer's core library and Python bindings on ARM — Apple Silicon (arm64 macOS) and Android (aarch64, via Termux) — while keeping the x86 build working. ARM support is layered on through the existing `TARGET`/OS abstraction, keyed off `__aarch64__`/`__arm__` and `__ANDROID__` (C) and `uname -m`/`uname -o` (make); x86-64/glibc Linux is the unchanged default branch.
 
-**Status — Phase 1 done (arm64 macOS core build).** A plain `make` on Apple Silicon produces native arm64 `liblazer.a` and `liblazer.so`. Individual smoke tests pass (`lazer-test`, `int-test`, `rng-test`, `poly-test`, `intvec-test`); a full `make check` run has not yet been completed end-to-end. Remaining: Python bindings on arm64 macOS (Phase 3), mobile cross-compilation (Phase 4).
+**Status:** the core C library (`liblazer.a`/`.so`) and the Python module build and run natively on both arm64 macOS and Android/Termux. C tests pass (`int-test`, `poly-test`, `intvec-test`, `rng-test`, …) and the Python demos run (`demo.py`, `anon_cred.py`, `kyber1024`, `blindsig`). A full `make check` hasn't been run end-to-end. LaBRADOR-based demos (`agg_sig.py`) remain out of scope on ARM. iOS is scaffolded (`_OS_IOS` branch) but not built.
 
-**Scope decisions:** HEXL uses its built-in non-AVX native fallback (not ported/optimized, only made to build). LaBRADOR is dropped on ARM (x86-only `.S` NTT assembly in `src/labrador/`); the `agg_sig.py`/`labrador.py` demos are out of scope there. Falcon uses its portable native-double FFT (`-DFALCON_FPNATIVE` only, no AVX2/FMA).
+**Scope decisions:** HEXL uses its built-in non-AVX native path (made to build, not optimized). LaBRADOR is dropped on ARM (x86-only `.S` NTT assembly in `src/labrador/`). Falcon uses its portable native-double FFT (`-DFALCON_FPNATIVE` only, no AVX2/FMA). The PRNG is set to SHAKE128 (see "Performance" below).
 
-### Building on arm64 macOS
+### Building
 
+**arm64 macOS:**
 ```bash
-brew install gmp mpfr cpu_features   # one-time native deps
-make                                 # produces liblazer.a + liblazer.so (arm64)
+brew install gmp mpfr cpu_features   # one-time
+make                                 # liblazer.a + liblazer.so (arm64)
+cd python && make                    # _lazer_cffi
 ```
+**Android (Termux):**
+```bash
+pkg install clang make cmake binutils git unzip patch libgmp libmpfr libffi python
+pip install cffi
+make
+cd python && make
+```
+No env vars needed — the Makefile auto-detects the platform (Homebrew paths + cmake flags on macOS; Termux prefix is already on the default paths). Tested: Apple clang 14 + cmake 4.1; Termux clang 21. To run a Python demo on macOS, `liblazer.so`'s install name is unqualified, so set `DYLD_LIBRARY_PATH=<repo root>` (on Linux/Android the rpath is honored automatically).
 
-No env vars needed — the Makefile auto-detects arm64 macOS and handles Homebrew paths, cmake flags, and the HEXL patch. (Tested on Apple clang 14, cmake 4.1, Homebrew at `/opt/homebrew`.)
+### ⚠️ Two compiler miscompilations of the bignum code (the hard part)
 
-### Changes that made it work (all gated so x86/Linux is untouched)
+lazer's multi-precision integer layer (`src/lazer-in2.h`, the `limbs_*` helpers) hit **two distinct compiler bugs** on ARM. Both produce *silently wrong arithmetic* (not crashes): wrong modular reductions → the prover's rejection/norm checks never pass → it loops forever. They're caught by `int-test` and `poly-test` — **always run those after touching this code or changing compiler/opt flags.**
 
-- [config.h](config.h) — `TARGET` is now arch-conditional: `TARGET_GENERIC` on `__aarch64__`/`__arm__`, else `TARGET_AMD64`. This master switch selects the portable AES-CTR path ([src/aes256ctr.c](src/aes256ctr.c), validated by `rng-test`) and disables the AES-NI path ([src/aes256ctr-amd64.c](src/aes256ctr-amd64.c)).
-- [src/lazer-in2.h](src/lazer-in2.h) — (1) the second `immintrin.h`/`x86intrin.h` include is now gated on `TARGET == TARGET_AMD64` (was `#ifndef _OS_IOS`, which still fired on arm64 macOS). (2) `_addcarry_u64_`/`_subborrow_u64_` use the x86 intrinsics only on `TARGET_AMD64`; **all other targets now use `unsigned __int128`**, not `__builtin_addcll`/`__builtin_subcll`. ⚠️ The `__builtin_*cll` carry-chain builtins are **miscompiled by Apple clang 14 on arm64 at -O2/-O3** (correct at -O0/-O1) — they silently drop the inter-limb borrow, corrupting all multi-limb integer arithmetic. `int-test` catches this. Do not reintroduce them.
-- [Makefile](Makefile) — arch/OS detection at the top sets `ARCH_ARM`/`OS_MACOS`. On ARM: Falcon flags drop to `-DFALCON_FPNATIVE`, `-march=native` → `-mcpu=native`, C++ runtime `-lstdc++` → `-lc++`, LaBRADOR `.so`s and `valgrind-test` are excluded. On macOS it also adds Homebrew `-I`/`-L`, the HEXL static lib is found under `lib/` or `lib64/`, `hexl.cpp` is compiled with `-std=c++17` (Apple clang doesn't default to it; gcc 13 does), and `liblazer.so` is linked self-contained (macOS dylibs can't carry undefined symbols — Linux `.so`s can, so this is macOS-only).
-- [src/hexl.patch](src/hexl.patch) — applied to the HEXL tree right after unzip (like `falcon.patch`). HEXL's `cpu-features.hpp` and three `*-avx512`/util headers `#include <immintrin.h>` unconditionally and get pulled into HEXL's *native* TUs; the patch arch-guards those includes and forces `has_avx512* = false` on non-x86, so HEXL builds entirely on its native path. The AVX512 `.cpp` files are already CMake-gated on `HEXL_HAS_AVX512DQ` (off on ARM), so they aren't compiled. **This patch is the durable home for the HEXL fix — never hand-edit the unzipped `third_party/hexl-development/` tree, since `make`/`make clean` re-unzips and discards edits.**
-- HEXL build, macOS specifics (in the `$(HEXL_DIR)` Makefile rule): cmake gets `-DCMAKE_PREFIX_PATH=$(brew --prefix)` so `find_package(CpuFeatures)` finds Homebrew's modern `cpu_features` instead of HEXL's bundled 2021 version (which has no Apple Silicon support and fails to build), and `CMAKE_POLICY_VERSION_MINIMUM=3.5` so cmake ≥ 4 will configure HEXL's old-minimum sub-builds.
+1. **`__builtin_addcll`/`__builtin_subcll` carry chain** — miscompiled by Apple clang at `-O2`/`-O3` (drops the inter-limb borrow). The iOS branch originally used these. Fixed by using `unsigned __int128` for the carry/borrow on all non-`TARGET_AMD64` targets. **Do not reintroduce the `__builtin_*cll` builtins.**
+2. **Strict-aliasing UB** — `limb_t` is `uint64_t`, which is `unsigned long long` on Apple arm64 but `unsigned long` on **LP64 Linux/Android**. The stores `(unsigned long long *)&r[i]` in `limbs_add`/`limbs_sub`/`limbs_to_twoscom` type-punned an `unsigned long` object on Linux aarch64 → UB that **clang 21 exploits at `-O2`/`-O3`** (and the failure point moves with the opt level — the classic UB tell). Apple clang 14 never saw it because the types coincide there. Fixed by storing through a real `unsigned long long` temp instead of the type-punned pointer (also closes the same latent UB on x86). **Don't cast limb pointers between `unsigned long`/`unsigned long long`.**
+
+### Other changes (all gated so x86/glibc Linux is untouched)
+
+- [config.h](config.h) — `TARGET` is arch-conditional: `TARGET_GENERIC` on ARM, else `TARGET_AMD64`. Selects the portable AES-CTR ([src/aes256ctr.c](src/aes256ctr.c)) over AES-NI ([src/aes256ctr-amd64.c](src/aes256ctr-amd64.c)). Also `RNG RNG_SHAKE128` (see Performance).
+- [src/lazer-in2.h](src/lazer-in2.h) — the second `immintrin.h` include re-gated on `TARGET == TARGET_AMD64` (was `#ifndef _OS_IOS`, fired on arm64 macOS). Under `__ANDROID__`, include `<strings.h>` + `<sys/random.h>` and `#define explicit_bzero bzero` (Bionic puts `explicit_bzero` in `<strings.h>` and `getentropy` in `<sys/random.h>`, unlike glibc).
+- [Makefile](Makefile) — detects `ARCH_ARM`/`OS_MACOS`/`OS_ANDROID`. ARM: Falcon `-DFALCON_FPNATIVE` only, `-march=native`→`-mcpu=native`, LaBRADOR + `valgrind-test` excluded. C++ runtime: `-lstdc++` (glibc) / `-lc++` (macOS) / `-lc++_shared` (Termux). `hexl.cpp` always `-std=c++17`. HEXL static lib found under `lib/` or `lib64/`. macOS: Homebrew `-I`/`-L`, self-contained `liblazer.so` link (macOS dylibs can't carry undefined symbols; Linux/Android can), and HEXL cmake gets `-DCMAKE_PREFIX_PATH=$(brew --prefix)` + `CMAKE_POLICY_VERSION_MINIMUM=3.5`.
+- [src/hexl.patch](src/hexl.patch) — applied after unzip (like `falcon.patch`). HEXL's `cpu-features.hpp` and three `*-avx512` util headers `#include <immintrin.h>` unconditionally and get pulled into HEXL's *native* TUs; the patch arch-guards those includes and forces `has_avx512* = false` on non-x86. The AVX512 `.cpp` files are already CMake-gated on `HEXL_HAS_AVX512DQ` (off on ARM). **This patch is the durable home for the HEXL fix — never hand-edit the unzipped `third_party/hexl-development/` tree; `make`/`make clean` re-unzips and discards edits.** On macOS the bundled 2021 `cpu_features` lacks Apple Silicon support (hence Homebrew's); on aarch64 Linux/Android the bundled one builds.
+- [python/lazer_cffi_build.py](python/lazer_cffi_build.py) — C++ runtime is platform-aware: `c++` (macOS), `c++_shared` (Android/Termux, detected via `ANDROID_ROOT`/`PREFIX`), `stdc++` (glibc). On Termux there is no `libc++.so`, only `libc++_shared.so`, so linking `c++` produces a module that fails to load. (`params_cffi_build.py` links no C++ libs, so it needs no change.)
+
+### Performance note (ARM)
+lazer's generic C AES (`TARGET_GENERIC`) is **pathologically slow** — on ARM, `RNG_AES256CTR` made `anon_cred` ~40–70× slower than `RNG_SHAKE128`, because the whole runtime was software AES. `config.h` is therefore set to `RNG_SHAKE128` on this branch. A future option is a NEON hardware-AES backend (ARMv8 `vaeseq_u8`), which all Apple Silicon and arm64 Android SoCs support, to keep AES as the RNG at speed. Note `config.h`'s `RNG` is global (not arch-conditional) — x86 with AES-NI prefers `RNG_AES256CTR`.
 
 ### Not yet done
-- **Python bindings (Phase 3):** [python/lazer_cffi_build.py](python/lazer_cffi_build.py) still lists `stdc++` (needs `c++` on macOS) and a fixed hexl lib dir; [python/params_cffi_build.py](python/params_cffi_build.py) inherits the same. LaBRADOR `.so` auto-detection is already conditional, so it no-ops on ARM.
-- **Mobile (Phase 4):** iOS/Android consume `liblazer.a` via the C API directly (the cffi layer is desktop-only). The `_OS_IOS` branch in `src/lazer-in2.h` already handles iOS endian/`bzero`. A mobile build is a separate cross-compilation against the platform SDK, not the in-repo Makefile as-is.
-- **Full `make check`** has not been run to completion on arm64 macOS.
+- Full `make check` to completion on ARM.
+- iOS build (cross-compile `liblazer.a` against the SDK; `_OS_IOS` header branch exists).
+- NEON hardware AES; HEXL/Falcon ARM vectorization (left on the portable path).
 
 ## Build commands
 
@@ -55,7 +73,7 @@ make clean
 - `make -j` parallelizes compilation.
 - On first build, the Makefile unzips `third_party/Falcon-impl-20211101.zip` (applying `src/falcon.patch`) and `third_party/hexl-development.zip` (applying `src/hexl.patch`, then cmake-built). On x86 it also clones Google `cpu_features` from GitHub for HEXL (internet required); on macOS it uses Homebrew's `cpu_features` instead (see the ARM section).
 - `liblabrador` is built once per modulus bit-width as a separate `.so` (`LOGQ` = 24/32/40/48); LaBRADOR lives in the `src/labrador` git submodule. **Not built on ARM.**
-- **arm64 macOS:** `brew install gmp mpfr cpu_features` first; then plain `make` works (see the ARM port section above).
+- **ARM (arm64 macOS / Android-Termux):** install the native deps first, then plain `make` works — see the "ARM port" section above for the exact dependency list and notes.
 
 Python module (after the C library is built):
 ```bash
