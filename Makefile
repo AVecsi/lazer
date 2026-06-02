@@ -1,12 +1,59 @@
+# Architecture / OS detection: ARM (Apple Silicon, mobile arm64) builds the
+# portable path; x86-64 keeps the AVX/AES path. Override by setting ARCH_ARM=1.
+UNAME_M := $(shell uname -m)
+UNAME_S := $(shell uname -s)
+ifneq (,$(filter arm64 aarch64 arm,$(UNAME_M)))
+ARCH_ARM = 1
+endif
+ifeq ($(UNAME_S),Darwin)
+OS_MACOS = 1
+# Homebrew (gmp, mpfr, cpu_features) is not on the default compiler/cmake paths.
+BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
+CPPFLAGS += -I$(BREW_PREFIX)/include
+# HEXL's bundled cpu_features predates Apple Silicon; point cmake at Homebrew's,
+# and allow modern cmake (>=4) to configure HEXL's old min-version sub-builds.
+HEXL_CMAKE_ENV = CMAKE_POLICY_VERSION_MINIMUM=3.5
+HEXL_CMAKE_FLAGS = -DCMAKE_PREFIX_PATH=$(BREW_PREFIX)
+endif
+
+# Falcon: x86 uses AVX2/FMA; ARM uses the portable native-double FFT only.
 CFLAGS_FALCON_AMD64 = -DFALCON_FPNATIVE -DFALCON_AVX2 -DFALCON_FMA
+CFLAGS_FALCON_ARM = -DFALCON_FPNATIVE
+ifdef ARCH_ARM
+CFLAGS_FALCON = $(CFLAGS_FALCON_ARM)
+else
+CFLAGS_FALCON = $(CFLAGS_FALCON_AMD64)
+endif
+
+# Arch tuning: -march=native is x86-only; ARM (Apple/clang) uses -mcpu=native.
+ifdef ARCH_ARM
+CFLAGS_ARCH = -mcpu=native
+else
+CFLAGS_ARCH = -march=native -mtune=native
+endif
+
 CFLAGS_WARN = -Wall -Wextra
-CFLAGS_DEFAULT = $(CFLAGS_WARN) -O3 -g -march=native -mtune=native\
+CFLAGS_DEFAULT = $(CFLAGS_WARN) -O3 -g $(CFLAGS_ARCH)\
  -fomit-frame-pointer
 CFLAGS_DEBUG = $(CFLAGS_WARN) -Og -ggdb3
 ADD_CPPFLAGS = -DNDEBUG
 
 CPPFLAGS += $(ADD_CPPFLAGS)
-LIBS = -lm $(HEXL_DIR)/build/hexl/lib64/libhexl.a -lstdc++
+
+# C++ runtime: libc++ on macOS, libstdc++ on Linux.
+ifdef OS_MACOS
+CXXLIB = -lc++
+else
+CXXLIB = -lstdc++
+endif
+
+# HEXL static lib lives in its build tree; lib64 on most Linux, lib on macOS.
+# Resolved lazily (when a link recipe runs) since HEXL is built on demand.
+HEXL_LIB = $(shell ls $(HEXL_DIR)/build/hexl/lib64/libhexl.a 2>/dev/null || ls $(HEXL_DIR)/build/hexl/lib/libhexl.a 2>/dev/null)
+LIBS = -lm $(HEXL_LIB) $(CXXLIB)
+ifdef OS_MACOS
+LIBS += -L$(BREW_PREFIX)/lib
+endif
 
 # honor user CFLAGS
 ifdef CFLAGS
@@ -17,7 +64,7 @@ buildstr = debug
 CFLAGS = $(CFLAGS_DEBUG)
 else
 buildstr = default
-CFLAGS = $(CFLAGS_DEFAULT) $(CFLAGS_FALCON_AMD64) # XXX
+CFLAGS = $(CFLAGS_DEFAULT) $(CFLAGS_FALCON)
 endif
 endif
 
@@ -176,8 +223,9 @@ HEXL_ZIP = $(HEXL_DIR).zip
 
 $(HEXL_DIR): $(HEXL_ZIP)
 	cd $(THIRD_PARTY_DIR) && unzip $(HEXL_SUBDIR).zip
-	cd $(HEXL_DIR) && cmake -S . -B build -DHEXL_BENCHMARK=OFF -DHEXL_TESTING=OFF
-	cd $(HEXL_DIR) && cmake --build build
+	patch -d $(HEXL_DIR) -p1 < src/hexl.patch
+	cd $(HEXL_DIR) && $(HEXL_CMAKE_ENV) cmake -S . -B build -DHEXL_BENCHMARK=OFF -DHEXL_TESTING=OFF $(HEXL_CMAKE_FLAGS)
+	cd $(HEXL_DIR) && $(HEXL_CMAKE_ENV) cmake --build build
 #	cd $(HEXL_DIR) && cmake -S . -B build -DHEXL_SHARED_LIB=ON
 #	cd $(HEXL_DIR) && cmake --build build
 
@@ -448,7 +496,7 @@ TESTS = \
  tests/dcompress-test \
  tests/sage-test \
  tests/sage-test.sage \
- tests/valgrind-test \
+ $(VALGRIND_TEST) \
  tests/coder-test \
  tests/urandom-test \
  tests/brandom-test \
@@ -469,11 +517,25 @@ TEXSOURCES = \
  doc/changelog.tex
 
 
+# LaBRADOR has x86-only NTT assembly and is not built on ARM.
+ifdef ARCH_ARM
+LABRADOR_SO =
+else
+LABRADOR_SO = liblabrador24.so liblabrador32.so liblabrador40.so liblabrador48.so
+endif
+
+# valgrind-test needs <valgrind/memcheck.h>, unavailable on macOS; skip it there.
+ifdef OS_MACOS
+VALGRIND_TEST =
+else
+VALGRIND_TEST = tests/valgrind-test
+endif
+
 .PHONY: lib lib-all lib-static lib-shared lib-static-all lib-shared-all
 lib-all: lazer.h lib-static-all lib-shared-all
 lib: lazer.h lib-static lib-shared
 
-lib-shared-all: lazer.h liblazer.so liblabrador24.so liblabrador32.so liblabrador40.so liblabrador48.so
+lib-shared-all: lazer.h liblazer.so $(LABRADOR_SO)
 lib-shared: lazer.h liblazer.so
 lib-static-all: lazer.h liblazer.a
 lib-static: lazer.h liblazer.a
@@ -481,8 +543,16 @@ lib-static: lazer.h liblazer.a
 liblazer.a: src/lazer_static.o src/hexl_static.o $(FALCON_OBJ_STATIC)
 	ar rcs liblazer.a src/lazer_static.o src/hexl_static.o $(FALCON_OBJ_STATIC)
 
+# Linux shared libs may carry undefined symbols (resolved when the consumer
+# links); macOS dylibs may not, so link the dependencies into liblazer.so there.
+ifdef OS_MACOS
+SHARED_LIBS = $(LIBS)
+else
+SHARED_LIBS =
+endif
+
 liblazer.so: src/lazer_shared.o  src/hexl_shared.o $(FALCON_OBJ_SHARED)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -shared -o liblazer.so src/lazer_shared.o src/hexl_shared.o $(FALCON_OBJ_SHARED)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -shared -o liblazer.so src/lazer_shared.o src/hexl_shared.o $(FALCON_OBJ_SHARED) $(SHARED_LIBS)
 
 src/lazer_static.o: $(LIBSOURCES) lazer.h $(FALCON_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(FALCON_DIR) -I. -c -o src/lazer_static.o src/lazer.c
@@ -490,11 +560,12 @@ src/lazer_static.o: $(LIBSOURCES) lazer.h $(FALCON_DIR)
 src/lazer_shared.o: $(LIBSOURCES) lazer.h $(FALCON_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(FALCON_DIR) -I. -c -fPIC -o src/lazer_shared.o src/lazer.c
 
+# HEXL headers require C++17; gcc 13 defaults to it but Apple clang does not.
 src/hexl_static.o: src/hexl.h $(HEXL_DIR)
-	$(CXX) $(CPPFLAGS) $(CFLAGS) -Isrc -I$(HEXL_DIR)/hexl/include -c -o src/hexl_static.o src/hexl.cpp
+	$(CXX) $(CPPFLAGS) $(CFLAGS) -std=c++17 -Isrc -I$(HEXL_DIR)/hexl/include -c -o src/hexl_static.o src/hexl.cpp
 
 src/hexl_shared.o: src/hexl.h $(HEXL_DIR)
-	$(CXX) $(CPPFLAGS) $(CFLAGS) -Isrc -I$(HEXL_DIR)/hexl/include -c -fPIC -o src/hexl_shared.o src/hexl.cpp
+	$(CXX) $(CPPFLAGS) $(CFLAGS) -std=c++17 -Isrc -I$(HEXL_DIR)/hexl/include -c -fPIC -o src/hexl_shared.o src/hexl.cpp
 
 lazer.h: src/lazer-in1.h src/lazer-in2.h src/moduli.h config.h
 	cat src/lazer-in1.h > lazer.h

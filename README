@@ -39,6 +39,40 @@ To build the lazer C library, from the base directory, run:
 
 Optional: use make's `-j` option to speed up compilation.
 
+
+Building on Apple Silicon (arm64 macOS) -- experimental
+-------------------------------------------------------
+The core C library (liblazer.a / liblazer.so) also builds and runs
+natively on Apple Silicon (arm64) Macs. The x86-64 AVX/AES build is
+unchanged; the build system auto-detects the architecture.
+
+Differences from the x86-64 build:
+
+- Intel HEXL is built using its portable non-AVX (native) fallback;
+  no AVX acceleration is used on ARM.
+- LaBRADOR is NOT built on ARM (it contains x86-only assembly), so the
+  aggregate-signature demos (python/agg_sig.py, labrador.py) are
+  unavailable. All linear-relation proofs and the other demos work.
+- Falcon is built with its portable native-double FFT (no AVX2/FMA).
+
+Requirements: Xcode command line tools (Apple clang), make, cmake, and
+the GMP, MPFR and cpu_features libraries from Homebrew. Install the
+native dependencies once with:
+
+`brew install gmp mpfr cpu_features`
+
+Then build from the base directory with:
+
+`make`
+
+This produces liblazer.a and liblazer.so. No extra environment
+variables are needed: the Makefile detects arm64 macOS and sets the
+Homebrew include/library paths, the required cmake options for HEXL,
+and the architecture-specific compiler flags. Tested with Apple clang
+14, cmake 4.1 and Homebrew under /opt/homebrew.
+
+The Python module on arm64 macOS is not yet supported.
+
 To build lazer's python module, change to the `python` subdirectory and run:
 
 `make`

@@ -2005,7 +2005,7 @@ _get_coeffvec (poly_t poly)
   return poly->coeffs;
 }
 
-#ifndef _OS_IOS
+#if TARGET == TARGET_AMD64
 #include <immintrin.h>
 #include <x86intrin.h>
 #endif
@@ -2046,13 +2046,14 @@ static inline unsigned char
 _addcarry_u64_ (unsigned char c, unsigned long long x, unsigned long long y,
                 unsigned long long *p)
 {
-#ifdef _OS_IOS
-  unsigned long long cout;
-
-  *p = __builtin_addcll (x, y, c, &cout);
-  return cout;
-#else
+#if TARGET == TARGET_AMD64
   return _addcarry_u64 (c, x, y, p);
+#else
+  /* Portable carry add. The __builtin_addcll/subcll carry-chain builtins are
+     miscompiled by clang on AArch64 at -O2/-O3, so use __int128 instead. */
+  unsigned __int128 t = (unsigned __int128)x + y + c;
+  *p = (unsigned long long)t;
+  return (unsigned char)(t >> 64);
 #endif
 }
 
@@ -2060,13 +2061,14 @@ static inline unsigned char
 _subborrow_u64_ (unsigned char c, unsigned long long x, unsigned long long y,
                  unsigned long long *p)
 {
-#ifdef _OS_IOS
-  unsigned long long cout;
-
-  *p = __builtin_subcll (x, y, c, &cout);
-  return cout;
-#else
+#if TARGET == TARGET_AMD64
   return _subborrow_u64 (c, x, y, p);
+#else
+  /* Portable borrow subtract; see _addcarry_u64_ for why not __builtin_subcll.
+     On borrow the 128-bit result wraps, leaving the high half all-ones. */
+  unsigned __int128 t = (unsigned __int128)x - y - c;
+  *p = (unsigned long long)t;
+  return (unsigned char)((t >> 64) & 1);
 #endif
 }
 
