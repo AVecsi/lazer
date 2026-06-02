@@ -156,13 +156,27 @@ int_mod (int_t r, const int_t a, const int_t m)
     }
   else
     {
-      limb_t scratch[mpn_sec_div_r_itch (a->nlimbs, m->nlimbs)];
-      limb_t tmp[a->nlimbs];
+      /* mpn_sec_div_r requires a normalised divisor (most significant limb
+         nonzero), but m may be stored with leading zero limbs (e.g. a value
+         below 2^64 in a 2-limb int_t). Passing the padded length is undefined
+         and miscompiles on some platforms (arm64), so use the effective size
+         and zero-extend the remainder. */
+      unsigned int mnlimbs, i;
+      for (mnlimbs = m->nlimbs; mnlimbs > 1 && m->limbs[mnlimbs - 1] == 0;
+           mnlimbs--)
+        ;
 
-      limbs_cpy (tmp, a->limbs, a->nlimbs);
-      mpn_sec_div_r (tmp, a->nlimbs, m->limbs, m->nlimbs, scratch);
-      limbs_cpy (r->limbs, tmp, r->nlimbs);
-      r->neg = a->neg;
+      {
+        limb_t scratch[mpn_sec_div_r_itch (a->nlimbs, mnlimbs)];
+        limb_t tmp[a->nlimbs];
+
+        limbs_cpy (tmp, a->limbs, a->nlimbs);
+        mpn_sec_div_r (tmp, a->nlimbs, m->limbs, mnlimbs, scratch);
+        limbs_cpy (r->limbs, tmp, mnlimbs);
+        for (i = mnlimbs; i < r->nlimbs; i++)
+          r->limbs[i] = 0;
+        r->neg = a->neg;
+      }
     }
 }
 
