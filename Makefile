@@ -16,6 +16,14 @@ HEXL_CMAKE_ENV = CMAKE_POLICY_VERSION_MINIMUM=3.5
 HEXL_CMAKE_FLAGS = -DCMAKE_PREFIX_PATH=$(BREW_PREFIX)
 endif
 
+# Android / Termux: Linux kernel + Bionic libc + clang/libc++. Deps (gmp, mpfr)
+# install to the Termux prefix, which is already on the default search paths.
+ifeq ($(shell uname -o 2>/dev/null),Android)
+OS_ANDROID = 1
+# Termux's cmake may be >=4 and HEXL's sub-builds declare an old min version.
+HEXL_CMAKE_ENV = CMAKE_POLICY_VERSION_MINIMUM=3.5
+endif
+
 # Falcon: x86 uses AVX2/FMA; ARM uses the portable native-double FFT only.
 CFLAGS_FALCON_AMD64 = -DFALCON_FPNATIVE -DFALCON_AVX2 -DFALCON_FMA
 CFLAGS_FALCON_ARM = -DFALCON_FPNATIVE
@@ -40,11 +48,13 @@ ADD_CPPFLAGS = -DNDEBUG
 
 CPPFLAGS += $(ADD_CPPFLAGS)
 
-# C++ runtime: libc++ on macOS, libstdc++ on Linux.
+# C++ runtime: libc++ with clang on macOS/Android, libstdc++ on glibc/gcc Linux.
+CXXLIB = -lstdc++
 ifdef OS_MACOS
 CXXLIB = -lc++
-else
-CXXLIB = -lstdc++
+endif
+ifdef OS_ANDROID
+CXXLIB = -lc++
 endif
 
 # HEXL static lib lives in its build tree; lib64 on most Linux, lib on macOS.
@@ -524,11 +534,13 @@ else
 LABRADOR_SO = liblabrador24.so liblabrador32.so liblabrador40.so liblabrador48.so
 endif
 
-# valgrind-test needs <valgrind/memcheck.h>, unavailable on macOS; skip it there.
+# valgrind-test needs <valgrind/memcheck.h>, unavailable on macOS/Termux; skip there.
+VALGRIND_TEST = tests/valgrind-test
 ifdef OS_MACOS
 VALGRIND_TEST =
-else
-VALGRIND_TEST = tests/valgrind-test
+endif
+ifdef OS_ANDROID
+VALGRIND_TEST =
 endif
 
 .PHONY: lib lib-all lib-static lib-shared lib-static-all lib-shared-all
