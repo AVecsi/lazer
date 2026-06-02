@@ -16,7 +16,7 @@ Toolchain: gcc >= 13.2, make >= 4.2, cmake >= 3.26, sagemath >= 10.2, python3 >=
 
 **Goal:** build and run lazer's core library and Python bindings on ARM — Apple Silicon (arm64 macOS) and Android (aarch64, via Termux) — while keeping the x86 build working. ARM support is layered on through the existing `TARGET`/OS abstraction, keyed off `__aarch64__`/`__arm__` and `__ANDROID__` (C) and `uname -m`/`uname -o` (make); x86-64/glibc Linux is the unchanged default branch.
 
-**Status:** the core C library (`liblazer.a`/`.so`) and the Python module build and run natively on both arm64 macOS and Android/Termux. C tests pass (`int-test`, `poly-test`, `intvec-test`, `rng-test`, …) and the Python demos run (`demo.py`, `anon_cred.py`, `kyber1024`, `blindsig`). A full `make check` hasn't been run end-to-end. LaBRADOR-based demos (`agg_sig.py`) remain out of scope on ARM. iOS is scaffolded (`_OS_IOS` branch) but not built.
+**Status:** the core C library (`liblazer.a`/`.so`) and the Python module build and run natively on both arm64 macOS and Android/Termux. **`make check` passes 25/25 on arm64 macOS** (sage-test runs; nothing skipped), matching x86. The Python demos run (`demo.py`, `anon_cred.py`, `kyber1024`, `blindsig`). LaBRADOR-based demos (`agg_sig.py`) remain out of scope on ARM. iOS is scaffolded (`_OS_IOS` branch) but not built.
 
 **Scope decisions:** HEXL uses its built-in non-AVX native path (made to build, not optimized). LaBRADOR is dropped on ARM (x86-only `.S` NTT assembly in `src/labrador/`). Falcon uses its portable native-double FFT (`-DFALCON_FPNATIVE` only, no AVX2/FMA). The PRNG is set to SHAKE128 (see "Performance" below).
 
@@ -37,12 +37,13 @@ cd python && make
 ```
 No env vars needed — the Makefile auto-detects the platform (Homebrew paths + cmake flags on macOS; Termux prefix is already on the default paths). Tested: Apple clang 14 + cmake 4.1; Termux clang 21. To run a Python demo on macOS, `liblazer.so`'s install name is unqualified, so set `DYLD_LIBRARY_PATH=<repo root>` (on Linux/Android the rpath is honored automatically).
 
-### ⚠️ Two compiler miscompilations of the bignum code (the hard part)
+### ⚠️ Three latent-bug classes in the bignum code (the hard part)
 
-lazer's multi-precision integer layer (`src/lazer-in2.h`, the `limbs_*` helpers) hit **two distinct compiler bugs** on ARM. Both produce *silently wrong arithmetic* (not crashes): wrong modular reductions → the prover's rejection/norm checks never pass → it loops forever. They're caught by `int-test` and `poly-test` — **always run those after touching this code or changing compiler/opt flags.**
+lazer's multi-precision integer layer (`src/int.c`, `src/lazer-in2.h`'s `limbs_*` helpers) hit **three distinct bugs** on ARM, all producing *silently wrong arithmetic* (not crashes): wrong modular reductions → either the prover's rejection/norm checks never pass (it loops forever) or proofs fail to verify. They're caught by `int-test`/`poly-test`/`abdlop-test` — **always run `make check` after touching this code or changing compiler/opt flags.** The first two were caught only with the right test; #3 needed a >64-bit-modulus parameter set (`abdlop-params2`).
 
 1. **`__builtin_addcll`/`__builtin_subcll` carry chain** — miscompiled by Apple clang at `-O2`/`-O3` (drops the inter-limb borrow). The iOS branch originally used these. Fixed by using `unsigned __int128` for the carry/borrow on all non-`TARGET_AMD64` targets. **Do not reintroduce the `__builtin_*cll` builtins.**
-2. **Strict-aliasing UB** — `limb_t` is `uint64_t`, which is `unsigned long long` on Apple arm64 but `unsigned long` on **LP64 Linux/Android**. The stores `(unsigned long long *)&r[i]` in `limbs_add`/`limbs_sub`/`limbs_to_twoscom` type-punned an `unsigned long` object on Linux aarch64 → UB that **clang 21 exploits at `-O2`/`-O3`** (and the failure point moves with the opt level — the classic UB tell). Apple clang 14 never saw it because the types coincide there. Fixed by storing through a real `unsigned long long` temp instead of the type-punned pointer (also closes the same latent UB on x86). **Don't cast limb pointers between `unsigned long`/`unsigned long long`.**
+2. **Strict-aliasing UB** — `limb_t` is `uint64_t`, which is `unsigned long long` on Apple arm64 but `unsigned long` on **LP64 Linux/Android**. The stores `(unsigned long long *)&r[i]` in `limbs_add`/`limbs_sub`/`limbs_to_twoscom` type-punned an `unsigned long` object on Linux aarch64 → UB that **clang 21 exploits at `-O2`/`-O3`** (failure point moves with the opt level — the classic UB tell). Apple clang 14 never saw it because the types coincide there. Fixed by storing through a real `unsigned long long` temp (also closes the same latent UB on x86). **Don't cast limb pointers between `unsigned long`/`unsigned long long`.**
+3. **Non-normalised divisor to GMP** — `int_mod` passed `m->nlimbs` to `mpn_sec_div_r`, but `m` may carry leading zero limbs (a sub-2⁶⁴ modulus in a 2-limb `int_t`). `mpn_sec_*` requires a normalised divisor (top limb nonzero); the padded call is UB — benign on x86, but on arm64 it duplicated the low limb into the high one (result off by ~2⁶⁴). This only triggers with a **>64-bit modulus** (e.g. `abdlop-params2`, q≈2⁷⁶), corrupting the `dcompress` high-bits reduction and breaking ABDLOP/lnp-quad verification while the d=64/single-limb tests passed. Fixed by trimming `m` to its effective limb count before the `mpn` call and zero-extending the remainder (as `int_div` already does via `bnlimbs`). **Any `mpn_sec_*` call must use the divisor's trimmed length, not the padded `int_t` `nlimbs`.**
 
 ### Other changes (all gated so x86/glibc Linux is untouched)
 
@@ -56,7 +57,7 @@ lazer's multi-precision integer layer (`src/lazer-in2.h`, the `limbs_*` helpers)
 lazer's generic C AES (`TARGET_GENERIC`) is **pathologically slow** — on ARM, `RNG_AES256CTR` made `anon_cred` ~40–70× slower than `RNG_SHAKE128`, because the whole runtime was software AES. `config.h` is therefore set to `RNG_SHAKE128` on this branch. A future option is a NEON hardware-AES backend (ARMv8 `vaeseq_u8`), which all Apple Silicon and arm64 Android SoCs support, to keep AES as the RNG at speed. Note `config.h`'s `RNG` is global (not arch-conditional) — x86 with AES-NI prefers `RNG_AES256CTR`.
 
 ### Not yet done
-- Full `make check` to completion on ARM.
+- `make check` on Android/Termux (passes 25/25 on arm64 macOS; not yet run end-to-end on Termux).
 - iOS build (cross-compile `liblazer.a` against the SDK; `_OS_IOS` header branch exists).
 - NEON hardware AES; HEXL/Falcon ARM vectorization (left on the portable path).
 
