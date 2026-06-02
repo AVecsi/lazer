@@ -79,10 +79,12 @@ extern struct debuginfo debug;
 #define _OS_LINUX
 #include <endian.h>
 #ifdef __ANDROID__
-/* Android's Bionic libc, unlike glibc, declares explicit_bzero in <strings.h>
-   and getentropy in <sys/random.h>. */
+/* Bionic provides getentropy via <sys/random.h>, but (unlike glibc) does not
+   declare explicit_bzero in any libc header, so alias it to bzero as the
+   Apple branches below do. */
 #include <strings.h>
 #include <sys/random.h>
+#define explicit_bzero bzero
 #endif
 
 #elif __APPLE__
