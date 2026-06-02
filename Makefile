@@ -48,13 +48,13 @@ ADD_CPPFLAGS = -DNDEBUG
 
 CPPFLAGS += $(ADD_CPPFLAGS)
 
-# C++ runtime: libc++ with clang on macOS/Android, libstdc++ on glibc/gcc Linux.
+# C++ runtime: libc++ on macOS, Android/Termux's libc++_shared, libstdc++ on glibc.
 CXXLIB = -lstdc++
 ifdef OS_MACOS
 CXXLIB = -lc++
 endif
 ifdef OS_ANDROID
-CXXLIB = -lc++
+CXXLIB = -lc++_shared
 endif
 
 # HEXL static lib lives in its build tree; lib64 on most Linux, lib on macOS.

@@ -396,11 +396,13 @@ includedirs = [prefix]
 # XXX get hexl path from build system
 libdirs = [prefix, f"{prefix}/third_party/hexl-development/build/hexl/lib/", f"{prefix}/third_party/hexl-development/build/hexl/lib64/"]
 runtimelibdirs = [prefix, f"{prefix}/third_party/hexl-development/build/hexl/lib/", f"{prefix}/third_party/hexl-development/build/hexl/lib64/"]
-# C++ runtime: clang/libc++ on macOS and Android/Termux, libstdc++ on glibc Linux.
+# C++ runtime: libc++ on macOS, Android/Termux's libc++_shared, libstdc++ on glibc.
 cxxlib = 'stdc++'
-if sys.platform == 'darwin' or 'ANDROID_ROOT' in os.environ \
-   or os.environ.get('PREFIX', '').startswith('/data/data/com.termux'):
+if sys.platform == 'darwin':
     cxxlib = 'c++'
+elif 'ANDROID_ROOT' in os.environ \
+   or os.environ.get('PREFIX', '').startswith('/data/data/com.termux'):
+    cxxlib = 'c++_shared'
 libs_lazer = ['lazer', 'hexl', 'mpfr', 'gmp', 'm', cxxlib]
 source_lazer = """
 #include "lazer.h"
