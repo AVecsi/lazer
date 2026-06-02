@@ -2193,9 +2193,16 @@ limbs_add (limb_t *r, const limb_t *a, const limb_t *b, uint8_t c,
            unsigned int nlimbs)
 {
   unsigned int i;
+  unsigned long long t;
 
+  /* Store via a real unsigned long long, not (unsigned long long *)&r[i]:
+     limb_t is uint64_t, which is "unsigned long" on LP64 Linux, so the cast
+     would be a strict-aliasing violation that clang miscompiles at -O2/-O3. */
   for (i = 0; i < nlimbs; i++)
-    c = _addcarry_u64_ (c, a[i], b[i], (unsigned long long *)&r[i]);
+    {
+      c = _addcarry_u64_ (c, a[i], b[i], &t);
+      r[i] = (limb_t)t;
+    }
 
   return c;
 }
@@ -2205,9 +2212,13 @@ limbs_sub (limb_t *r, const limb_t *a, const limb_t *b, uint8_t c,
            unsigned int nlimbs)
 {
   unsigned int i;
+  unsigned long long t;
 
   for (i = 0; i < nlimbs; i++)
-    c = _subborrow_u64_ (c, a[i], b[i], (unsigned long long *)&r[i]);
+    {
+      c = _subborrow_u64_ (c, a[i], b[i], &t);
+      r[i] = (limb_t)t;
+    }
 
   return c;
 }
@@ -2234,11 +2245,13 @@ limbs_to_twoscom (limb_t *out, const limb_t *in, unsigned int nlimbs,
     {
       const limb_t mask = ~(limb_t)0;
       unsigned char c = 1;
+      unsigned long long t;
 
       for (i = 0; i < nlimbs; i++)
         {
           out[i] = in[i] ^ mask;
-          c = _addcarry_u64_ (c, out[i], 0, (unsigned long long *)&out[i]);
+          c = _addcarry_u64_ (c, out[i], 0, &t);
+          out[i] = (limb_t)t;
         }
     }
   else
