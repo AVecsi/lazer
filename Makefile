@@ -516,7 +516,8 @@ TESTS = \
  tests/lnp-quad-test \
  tests/lnp-quad-many-test \
  tests/lnp-quad-eval-test \
- tests/lnp-tbox-test
+ tests/lnp-tbox-test \
+ tests/anoncred-test
 
 
 TEXSOURCES = \
@@ -686,6 +687,12 @@ tests/lnp-quad-eval-test: tests/lnp-quad-eval-test.c $(TESTDEPS) tests/lnp-quad-
 
 tests/lnp-tbox-test: tests/lnp-tbox-test.c $(TESTDEPS) tests/lnp-tbox-params1.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -o $@ $< $(TESTLIBS)
+
+# anoncred is not part of liblazer.a's unity build, so compile src/anoncred.c
+# directly into the test (and add -Isrc for anoncred.h / anoncred-params.h).
+tests/anoncred-test: tests/anoncred-test.c $(TESTDEPS) src/anoncred.c \
+                     src/anoncred.h src/anoncred-params.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -Isrc -o $@ $< src/anoncred.c $(TESTLIBS)
 
 
 .PHONY: pdf

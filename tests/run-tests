@@ -28,6 +28,7 @@ tests = [
     'lnp-quad-many-test',
     'lnp-quad-eval-test',
     'lnp-tbox-test',
+    'anoncred-test',
 ]
 
 # automake test exit status
