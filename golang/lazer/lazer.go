@@ -1,12 +1,17 @@
 package lazer
 
 /*
-#cgo CFLAGS: -g -Wall -Wextra -I../../
-#cgo LDFLAGS: ./../liblazer.a -lmpfr -lgmp -lm
+#cgo CFLAGS: -g -Wall -Wextra -I${SRCDIR}/../.. -I${SRCDIR}/../../src
+// Homebrew: /opt/homebrew on Apple Silicon, /usr/local on Intel Macs.
+// Nonexistent -I/-L dirs are ignored, so listing both covers either prefix.
+#cgo darwin CFLAGS: -I/opt/homebrew/include -I/usr/local/include
+#cgo darwin LDFLAGS: ${SRCDIR}/../../liblazer.a -lm ${SRCDIR}/../../third_party/hexl-development/build/hexl/lib/libhexl.a -L/opt/homebrew/lib -L/usr/local/lib -lc++ -lmpfr -lgmp
+#cgo linux LDFLAGS: ${SRCDIR}/../../liblazer.a -lm ${SRCDIR}/../../third_party/hexl-development/build/hexl/lib64/libhexl.a -lstdc++ -lmpfr -lgmp
 
 #include <gmp.h>
 #include <mpfr.h>
 #include "lazer.h"
+#include "anoncred.h"
 */
 import "C"
 import (
