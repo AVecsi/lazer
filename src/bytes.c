@@ -14,12 +14,18 @@ static int bits2hexdigit (uint8_t);
 void
 bytes_urandom (uint8_t *bytes, const size_t len)
 {
-  int rv;
+  size_t off;
 
-  ASSERT_ERR (len <= 256);
-
-  rv = getentropy (bytes, len);
-  ERR (rv != 0, "getentropy failed (size %llu).\n", (unsigned long long)len);
+  /* getentropy(2) rejects requests larger than 256 bytes, so chunk. Larger
+   * single requests arise from the bigger LNP parameter sets (e.g. the larger
+   * anoncred tiers). */
+  for (off = 0; off < len; off += 256)
+    {
+      size_t chunk = len - off < 256 ? len - off : 256;
+      int rv = getentropy (bytes + off, chunk);
+      ERR (rv != 0, "getentropy failed (size %llu).\n",
+           (unsigned long long)chunk);
+    }
 }
 
 size_t

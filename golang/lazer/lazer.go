@@ -1,7 +1,12 @@
 package lazer
 
 /*
-#cgo CFLAGS: -g -Wall -Wextra -I${SRCDIR}/../.. -I${SRCDIR}/../../src
+// -O2 is REQUIRED, not just for speed: anoncred.c is the only lazer TU compiled
+// here (the rest is prebuilt in liblazer.a at -O3). At -O0 the inlined bignum
+// helpers (lazer-in2.h limbs_*) hit optimization-sensitive UB that miscompiles
+// for the larger proof parameters (e.g. the largest anoncred tier), crashing at
+// run time. Build this TU at the library's optimization level. See CLAUDE.md.
+#cgo CFLAGS: -O2 -g -Wall -Wextra -I${SRCDIR}/../.. -I${SRCDIR}/../../src
 // Homebrew: /opt/homebrew on Apple Silicon, /usr/local on Intel Macs.
 // Nonexistent -I/-L dirs are ignored, so listing both covers either prefix.
 #cgo darwin CFLAGS: -I/opt/homebrew/include -I/usr/local/include

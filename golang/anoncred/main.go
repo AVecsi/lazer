@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"os"
 	"time"
@@ -8,87 +9,101 @@ import (
 	"XXX1.org/lazer"
 )
 
-// zeroOutBlocks zeroes the 8-byte message blocks at the given indices
-// (Go port of zero_out_bytes(msg, priv_mvec, deg//8)).
-func zeroOutBlocks(msg []byte, idx []uint) []byte {
-	out := make([]byte, len(msg))
-	copy(out, msg)
+// Tiered Option C / IRMA-fit demo. The message blocks are the user's secret
+// (the first AnonNumSecret blocks) followed by the issuer-controlled blocks
+// (metadata + public attributes). Credential size is dynamic: a credential
+// uses the smallest tier whose capacity covers its public-attribute count, and
+// the unused issuer blocks are zero. The user commits only the secret; the
+// issuer adds its blocks when signing. At disclosure any subset of issuer
+// blocks may be revealed; the secret stays hidden.
+
+// tierNmsgBytes returns the byte length of a tier's full message (secret +
+// issuer capacity blocks), 8 bytes per 64-bit block.
+func tierNmsgBytes(tier int) int {
+	return (lazer.AnonNumSecret + lazer.AnonTierNpub(tier)) * 8
+}
+
+// fullMsg concatenates the secret and the tier's issuer blocks.
+func fullMsg(secret, pubMsg []byte) []byte {
+	out := make([]byte, len(secret)+len(pubMsg))
+	copy(out, secret)
+	copy(out[len(secret):], pubMsg)
+	return out
+}
+
+// disclosedMsg returns a tier-length message with only the blocks in idx copied
+// from full (the rest zeroed) — the public message the verifier checks.
+func disclosedMsg(full []byte, idx []uint, tier int) []byte {
+	out := make([]byte, tierNmsgBytes(tier))
 	for _, i := range idx {
-		for j := uint(0); j < 8; j++ {
-			out[i*8+j] = 0
-		}
+		copy(out[i*8:i*8+8], full[i*8:i*8+8])
 	}
 	return out
 }
 
 func main() {
-	fmt.Print("lazer anonymous credentials demo (Go)\n")
-	fmt.Print("--------------------------\n\n")
+	fmt.Print("lazer anonymous credentials demo (Go, tiered Option C)\n")
+	fmt.Print("------------------------------------------------------\n\n")
 
-	// message: 64 bytes (8 message polynomials of 64 bits each)
-	msg := make([]byte, lazer.AnonMsgLen)
-	for i := range msg {
-		msg[i] = byte((i%8)*0x22 + 0x01)
+	// Choose a credential with this many public attributes; the tier follows.
+	const nPublic = 16
+	tier := lazer.AnonTierForNpub(nPublic)
+	if tier < 0 {
+		fmt.Printf("no tier for %d public attributes (max %d)\n", nPublic, lazer.AnonNpubMax)
+		os.Exit(1)
 	}
+	npubBlocks := lazer.AnonTierNpub(tier)
+	fmt.Printf("public attributes: %d -> tier %d (capacity %d, total %d blocks)\n\n",
+		nPublic, tier, npubBlocks, lazer.AnonNumSecret+npubBlocks)
 
-	// disclosed message indices and their complement
-	pubMvec := []uint{0, 4, 5}
-	var privMvec []uint
-	for i := uint(0); i < 8; i++ {
-		isPub := false
-		for _, p := range pubMvec {
-			if p == i {
-				isPub = true
-			}
-		}
-		if !isPub {
-			privMvec = append(privMvec, i)
-		}
+	// user secret (link secret)
+	secret := make([]byte, lazer.AnonSecretLen)
+	if _, err := rand.Read(secret); err != nil {
+		panic(err)
 	}
+	// issuer blocks: the tier's capacity (real attrs + zero padding)
+	pubMsg := make([]byte, npubBlocks*8)
+	if _, err := rand.Read(pubMsg[:nPublic*8]); err != nil {
+		panic(err)
+	}
+	full := fullMsg(secret, pubMsg)
+
+	// disclose two issuer blocks (indices >= AnonNumSecret); the secret hides.
+	pubMvec := []uint{uint(lazer.AnonNumSecret), uint(lazer.AnonNumSecret + 3)}
 
 	sk, pk := lazer.AnonKeygen()
 
-	fmt.Print("Initialize user with public key ... ")
-	user := lazer.AnonUserInit(pk)
-	fmt.Print("[OK]\n\n")
-
-	fmt.Print("Initialize signer with public and private key ... ")
+	fmt.Print("Initialize user, signer (issuer), verifier ... ")
+	user := lazer.AnonUserInit(pk, tier)
 	signer := lazer.AnonSignerInit(pk, sk)
-	fmt.Print("[OK]\n\n")
-
-	fmt.Print("Initialize verifier with public key ... ")
-	verifier := lazer.AnonVerifierInit(pk)
+	verifier := lazer.AnonVerifierInit(pk, tier)
 	fmt.Print("[OK]\n\n")
 
 	issueStart := time.Now()
-	fmt.Print("User outputs masked credentials (incl. proof of well-formedness) ... ")
-	maskedMsg := lazer.AnonUserMaskmsg(&user, msg)
-	fmt.Print("[OK]\n")
-	fmt.Printf("masked credentials (t,P1): %d bytes\n\n", len(maskedMsg))
+	fmt.Print("User commits its secret ... ")
+	maskedMsg := lazer.AnonUserMaskmsg(&user, secret)
+	fmt.Printf("[OK]  (masked: %d bytes)\n", len(maskedMsg))
 
-	fmt.Print("Signer checks the proof and outputs blinded credentials ... ")
-	rc, blindsig := lazer.AnonSignerSign(&signer, maskedMsg)
+	fmt.Print("Issuer checks P1, adds its blocks, blind-signs ... ")
+	rc, blindsig := lazer.AnonSignerSign(&signer, maskedMsg, pubMsg, tier)
 	if rc != 1 {
 		fmt.Print("masked credentials are invalid.\n")
 		os.Exit(1)
 	}
-	fmt.Print("[OK]\n")
+	fmt.Printf("[OK]  (blindsig: %d bytes)\n", len(blindsig))
 	issueTime := time.Since(issueStart)
-	fmt.Printf("blind credentials (tau,s1,s2): %d bytes\n\n", len(blindsig))
 
 	showStart := time.Now()
-	fmt.Print("User outputs a signature on the hidden credentials ... ")
-	rc, sig := lazer.AnonUserSign(&user, blindsig, pubMvec)
+	fmt.Print("User outputs a disclosure proof revealing chosen issuer blocks ... ")
+	rc, sig := lazer.AnonUserSign(&user, pubMsg, blindsig, pubMvec)
 	if rc != 1 {
 		fmt.Print("decoding failed.\n")
 		os.Exit(1)
 	}
-	fmt.Print("[OK]\n")
-	fmt.Printf("signature (P2): %d bytes\n\n", len(sig))
+	fmt.Printf("[OK]  (proof: %d bytes)\n", len(sig))
 
-	fmt.Print("Verifier verifies the signature of the blinded credentials ... ")
-	msgPub := zeroOutBlocks(msg, privMvec)
-	rc = lazer.AnonVerifierVrfy(&verifier, msgPub, pubMvec, sig)
+	fmt.Print("Verifier verifies the disclosure proof ... ")
+	rc = lazer.AnonVerifierVrfy(&verifier, disclosedMsg(full, pubMvec, tier), pubMvec, sig)
 	showTime := time.Since(showStart)
 	if rc != 1 {
 		fmt.Print("signature invalid.\n")

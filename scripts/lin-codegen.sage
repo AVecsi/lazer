@@ -120,7 +120,17 @@ load("lnp-tbox-codegen.sage")
 proof_bits_ = proof_bits
 
 
-while True:
+# Optional spec flag: keep the entire witness in the Ajtai part (l = 0). The
+# BDLOP-move optimization below moves the largest-norm subvector into the BDLOP
+# (m) part to shrink the proof, but that exercises the lin-proofs m-partition
+# path, which is currently unreliable (see the "doesnt work" note below). Specs
+# that need a working proof at large witness dimensions set no_bdlop = True.
+try:
+    no_bdlop
+except NameError:
+    no_bdlop = False
+
+while not no_bdlop:
     maxval = 0
     maxidx = 0
     for i in ajtai:

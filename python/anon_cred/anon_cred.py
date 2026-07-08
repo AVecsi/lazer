@@ -77,6 +77,7 @@ class user_t:
         # return masked message t,p1enc
         return tenc + proof
 
+    # Disclosure
     def sign(self, blindsig: bytes, pub_mvec: list):
         # decode blindsig tau,s1,s2
         
@@ -149,6 +150,7 @@ class signer_t:
         tau = polyvec_t(RING,8,tau_)
 
         # preimage sampling
+        #TODO mi is tortenik itt pontosan?
         s1, s2 = falcon_preimage_sample(self.sk, ATAU * tau + t,RING)
         #s1, s2 = falcon_preimage_sample(self.sk, ATAU * tau + t)
 
