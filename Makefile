@@ -694,6 +694,28 @@ tests/anoncred-test: tests/anoncred-test.c $(TESTDEPS) src/anoncred.c \
                      src/anoncred.h src/anoncred-params.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -Isrc -o $@ $< src/anoncred.c $(TESTLIBS)
 
+# fdb-test: full Falcon-512 device-binding proof. Self-contained and portable
+# (arm64 macOS, x86-64 Linux, aarch64 Android/Termux) via the same $(TESTLIBS)
+# the rest of the suite uses -- no hand-set include/lib paths. Run with `make fdb`.
+tests/fdb-test: tests/fdb-test.c $(TESTDEPS) tests/fdb-params.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -o $@ $< $(TESTLIBS)
+
+# Regenerate the params header only if missing/stale. The committed header means
+# a normal checkout needs no sagemath; this fallback covers a fresh git clone.
+tests/fdb-params.h: tests/fdb-params.sage
+	cd scripts && sage lnp-tbox-codegen.sage ../tests/fdb-params.sage > ../tests/fdb-params.h
+
+# One command to build (library first, if needed) and run fdb-test on any host.
+# liblazer is linked statically, so no runtime lib path is needed on Linux/Android;
+# on macOS we still set DYLD_LIBRARY_PATH defensively for the Homebrew GMP/MPFR dylibs.
+.PHONY: fdb
+fdb: tests/fdb-test
+ifdef OS_MACOS
+	DYLD_LIBRARY_PATH=$(CURDIR) ./tests/fdb-test
+else
+	./tests/fdb-test
+endif
+
 
 .PHONY: pdf
 pdf: doc/pdf/lazer_manual.pdf
