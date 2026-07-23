@@ -47,6 +47,7 @@ tests/lnp-quad-test
 tests/lnp-quad-many-test
 tests/lnp-quad-eval-test
 tests/lnp-tbox-test
+tests/fdb-test
 
 demos/blindsig/blindsig-demo
 demos/kyber1024/kyber124-demo
