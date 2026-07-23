@@ -15,23 +15,45 @@ wall (void)
 /*
  * FULL Falcon-512 device-binding proof.
  *
- * A Secure Element holds a Falcon-512 key (h = public key) and signs a verifier
- * challenge c: it returns a short (s1,s2) with s1 + s2*h = c (mod p=12289),
- * ||(s1,s2)|| <= beta.  A credential commits h.  We prove in ZERO KNOWLEDGE:
+ * Two independent roles, talking only over serialized byte buffers:
  *
- *     s1 + s2*h - c - p*k = 0     (8 block equations over Rp),
- *     ||(s1,s2)||_2 <= beta,      ||k||_inf <= B'
+ *   - the SIGNER holds a Falcon-512 keypair (sk, pk) in plain and, given a
+ *     challenge c, returns a short (s1,s2) with s1 + s2*h = c (mod
+ *     p=12289), ||(s1,s2)|| <= beta.  It then proves in ZERO KNOWLEDGE:
  *
- * revealing neither h nor the signature (only c is public).  Deg-512 objects are
- * the 8-block isoring representation; multiply-by-h is the matrix M_h (validated
- * in devicebind-isoring-test), so the quadratic term (s2*h)_iso[i] =
- * sum_{j,k} M_e[k][i][j] * h_iso[k] * s2_iso[j], with M_e[k]=lin_toisoring(e_k).
- * k is the mod-p quotient (route b).
+ *         s1 + s2*h - c - p*k = 0     (8 block equations over Rp),
+ *         ||(s1,s2)||_2 <= beta,      ||k||_inf <= B'
+ *
+ *     revealing neither h nor the signature (only c is public), and sends
+ *     the resulting proof (with its ABDLOP commitment) to the verifier.
+ *
+ *   - the VERIFIER never sees h, the signature, or any other witness value.
+ *     It picks the challenge c and sends it (serialized) to the signer; the
+ *     public commitment matrices (A1/A2prime/Bmat) and the quadratic
+ *     equations' R2/r1 structure are pure functions of the public
+ *     parameters, so it derives those independently rather than trusting a
+ *     copy from the signer. The one exception is r0 (the equations'
+ *     constant term): in this construction it is not reducible to a simple
+ *     closed form of c alone (see the comment on compute_r0), so -- as in
+ *     the original single-process version of this test, which simply
+ *     shared one r0 array between its prove and verify calls -- it is
+ *     computed by whoever holds the witness (the signer) and travels as
+ *     part of the serialized proof. This is a known limitation of the
+ *     construction, not something this refactor resolves; see
+ *     falcon-devicebind-design.md's "Risks" section.
+ *
+ * Deg-512 objects are the 8-block isoring representation; multiply-by-h is
+ * the matrix M_h (validated in devicebind-isoring-test), so the quadratic
+ * term (s2*h)_iso[i] = sum_{j,k} M_e[k][i][j] * h_iso[k] * s2_iso[j], with
+ * M_e[k]=lin_toisoring(e_k).  k is the mod-p quotient (route b).
  */
 
 #define NEQ 8       /* 8 quadratic block equations */
 #define ANON_P 12289
 #define ANON_DEG 64
+
+#define FDB_CHALLENGE_BYTES (512 * 2)
+#define FDB_PROOF_MAXLEN (1 << 20)
 
 static const limb_t anon_q_limbs[] = { ANON_P };
 static const int_t anon_q = { { (limb_t *)anon_q_limbs, 1, 0 } };
@@ -99,12 +121,266 @@ cpq (poly_ptr dst, poly_ptr src)
   poly_set_coeffvec_i64 (dst, c);
 }
 
-/* serialized proof size in bytes: replicates lin-proofs.c's static
- * lnp_tbox_encproof (mutates its polyvec args in place, so call it last). */
-static size_t
-fdb_proofsize (polyvec_t tA1, polyvec_t tB, polyvec_t h, poly_t c,
-               polyvec_t z1, polyvec_t z21, polyvec_t hint, polyvec_t z3,
-               polyvec_t z4, const lnp_tbox_params_t params)
+/* multiply-by-x matrix over the isoring: M = lin_toisoring(x) for x in RF */
+static void
+mul_matrix (polymat_t M, poly_t x)
+{
+  polymat_t xmat;
+  polyvec_t xvec, garb;
+  polymat_alloc (xmat, RF, 1, 1);
+  polyvec_alloc (xvec, RF, 1);
+  polyvec_alloc (garb, RP, 8);
+  polymat_set_elem (xmat, 0, 0, x);
+  polyvec_set_elem (xvec, 0, x);
+  lin_toisoring (M, garb, xmat, xvec);
+  polyvec_free (garb);
+  polyvec_free (xvec);
+  polymat_free (xmat);
+}
+
+/* the 8 fixed structure-constant matrices Me[k] = lin_toisoring(e_k),
+ * independent of the secret key h -- both the signer and the verifier need
+ * these (the signer to build r0, both to build R2/r1), so this is shared. */
+static void
+build_structure_constants (polymat_t Me[8])
+{
+  poly_t ef;
+  polyvec_t ev;
+  unsigned int i, j, kk;
+  int64_t gmax = 0;
+
+  poly_alloc (ef, RF);
+  polyvec_alloc (ev, RF, 8);
+  for (kk = 0; kk < 8; kk++)
+    {
+      polyvec_set_zero (ev);
+      poly_set_one (polyvec_get_elem (ev, kk));
+      poly_fromisoring (ef, ev);
+      polymat_alloc (Me[kk], RP, 8, 8);
+      mul_matrix (Me[kk], ef);
+      polymat_fromcrt (Me[kk]);
+      polymat_redc (Me[kk], Me[kk]); /* structure constants gamma in {0,+-1} */
+    }
+  /* sanity: report the largest |gamma| (expected 1 for the block-negacyclic
+   * iso) */
+  {
+    int64_t gc[ANON_DEG];
+    unsigned int blk;
+    for (kk = 0; kk < 8; kk++)
+      for (i = 0; i < 8; i++)
+        for (j = 0; j < 8; j++)
+          {
+            poly_get_coeffvec_i64 (gc, polymat_get_elem (Me[kk], i, j));
+            for (blk = 0; blk < RP->d; blk++)
+              {
+                int64_t a = gc[blk] < 0 ? -gc[blk] : gc[blk];
+                if (a > gmax)
+                  gmax = a;
+              }
+          }
+    fprintf (stderr, "  max|gamma| = %lld (expect 1)\n", (long long)gmax);
+  }
+
+  polyvec_free (ev);
+  poly_free (ef);
+}
+
+/* wire format for the Falcon challenge c: 512 coefficients, big-endian
+ * uint16 each (values are always in [0, ANON_P)). */
+static void
+challenge_encode (uint8_t out[FDB_CHALLENGE_BYTES], const int16_t cc16[512])
+{
+  unsigned int i;
+  for (i = 0; i < 512; i++)
+    {
+      out[2 * i] = (uint8_t)(((uint16_t)cc16[i]) >> 8);
+      out[2 * i + 1] = (uint8_t)(((uint16_t)cc16[i]) & 0xff);
+    }
+}
+
+static void
+challenge_decode (int16_t cc16[512], const uint8_t in[FDB_CHALLENGE_BYTES])
+{
+  unsigned int i;
+  for (i = 0; i < 512; i++)
+    cc16[i] = (int16_t)(((uint16_t)in[2 * i] << 8) | in[2 * i + 1]);
+}
+
+/*
+ * SIGNER state: the Falcon keypair (held in plain) plus everything needed
+ * to build the witness and the proof. Nothing here is ever read by the
+ * verifier -- only the serialized challenge (in) and proof (out) cross the
+ * boundary.
+ */
+typedef struct
+{
+  abdlop_params_srcptr tbox;
+  abdlop_params_srcptr quad;
+  lnp_quad_eval_params_srcptr quade;
+  polyring_srcptr Rq;
+  unsigned int d;
+  unsigned int m1;
+  unsigned int Z;
+  unsigned int l;
+  unsigned int lambda;
+  unsigned int n;
+  unsigned int n_;
+
+  /* Falcon keypair, in plain, and the per-challenge signature material */
+  uint8_t sk[1281], pk[897];
+  int16_t hc16[512], s1c16[512], s2c16[512];
+  poly_t hf, cf, s1f, s2f;
+  polymat_t Mh;
+  polyvec_t hiso, ciso, s1iso, s2iso;
+
+  /* witness + proof-output material */
+  polyvec_t s1, s2, mvec, tA1, tA2, tB, hout, z1, z21, hint, z3, z4;
+  polyvec_t vival;
+  poly_t cpoly;
+  spolymat_t R2ii[NEQ];
+  spolyvec_t r1ii[NEQ];
+  poly_t r0ii[NEQ];
+  spolymat_ptr R2[NEQ];
+  spolyvec_ptr r1[NEQ];
+  poly_ptr r0[NEQ];
+  polymat_t Es0, Em0, Ds, Dm, A1, A2prime, Bmat;
+  polyvec_t v0, u;
+  polymat_ptr Es[1], Em[1];
+  polyvec_ptr vv[1];
+
+  uint8_t hashp[32];
+  double t_prove;
+} fdb_signer_ctx_t[1];
+
+/*
+ * VERIFIER state: public data only.  There are no witness fields at all --
+ * it is structurally impossible for this struct to hold secret material.
+ */
+typedef struct
+{
+  abdlop_params_srcptr tbox;
+  abdlop_params_srcptr quad;
+  lnp_quad_eval_params_srcptr quade;
+  polyring_srcptr Rq;
+  unsigned int d;
+  unsigned int m1;
+  unsigned int Z;
+  unsigned int l;
+  unsigned int lambda;
+  unsigned int n;
+  unsigned int n_;
+
+  /* decode targets for the received proof */
+  polyvec_t tA1, tB, hout, z1, z21, hint, z3, z4;
+  poly_t cpoly;
+  poly_t r0ii[NEQ];
+  poly_ptr r0[NEQ];
+
+  spolymat_t R2ii[NEQ];
+  spolyvec_t r1ii[NEQ];
+  spolymat_ptr R2[NEQ];
+  spolyvec_ptr r1[NEQ];
+  polymat_t Es0, Em0, Ds, Dm, A1, A2prime, Bmat;
+  polyvec_t v0, u;
+  polymat_ptr Es[1], Em[1];
+  polyvec_ptr vv[1];
+
+  uint8_t hashv[32];
+  double t_verify;
+} fdb_verifier_ctx_t[1];
+
+/* ---- public equation structure: R2/r1 from the fixed Me[8] structure
+ * constants, independent of the secret key h.  Identical computation on
+ * both the signer and verifier side -- no secret data involved, so each
+ * side derives it independently rather than one side handing the other a
+ * live pointer. ------------------------------------------------------------ */
+static void
+build_equation_structure (spolymat_ptr R2[NEQ], spolyvec_ptr r1[NEQ],
+                          spolymat_t R2ii[NEQ], spolyvec_t r1ii[NEQ],
+                          polyring_srcptr Rq, unsigned int m1,
+                          unsigned int Z, unsigned int l, unsigned int n,
+                          unsigned int n_)
+{
+  polymat_t Me[8];
+  spolymat_t R2_;
+  spolyvec_t r1_;
+  unsigned int i, j, kk;
+  poly_ptr pe;
+
+  build_structure_constants (Me);
+
+  spolymat_alloc (R2_, Rq, n_, n_, (n_ * n_ - n_) / 2 + n_);
+  spolyvec_alloc (r1_, Rq, n_, n_);
+
+  /* eq i:  s1iso[i] + sum_{j,k} Me[k][i][j]*s2iso[j]*hiso[k] - c_i = 0
+   * local indices: s1iso[i]=2i, s2iso[j]=16+2j, hiso[k]=32+2k */
+  for (i = 0; i < NEQ; i++)
+    {
+      spolymat_alloc (R2ii[i], Rq, n, n, (n * n - n) / 2 + n);
+      spolyvec_alloc (r1ii[i], Rq, n, n);
+
+      spolymat_set_empty (R2_);
+      for (j = 0; j < 8; j++)
+        for (kk = 0; kk < 8; kk++)
+          {
+            poly_ptr g = polymat_get_elem (Me[kk], i, j); /* = gamma_{i,j,k} */
+            pe = spolymat_insert_elem (R2_, 16 + 2 * j, 32 + 2 * kk);
+            cpq (pe, g);
+          }
+      spolymat_sort (R2_);
+
+      spolyvec_set_empty (r1_);
+      pe = spolyvec_insert_elem (r1_, 2 * i); /* + s1iso[i] */
+      poly_set_one (pe);
+      pe = spolyvec_insert_elem (r1_, 48 + 2 * i); /* - p*k[i] */
+      poly_set_zero (pe);
+      int_set_i64 (poly_get_coeff (pe, 0), -(int64_t)ANON_P);
+      spolyvec_sort (r1_);
+
+      spolymat_fromcrt (R2_);
+      spolyvec_fromcrt (r1_);
+      _scatter_smat (R2ii[i], R2_, m1, Z, l);
+      _scatter_vec (r1ii[i], r1_, m1, Z);
+
+      R2[i] = R2ii[i];
+      r1[i] = r1ii[i];
+    }
+
+  spolyvec_free (r1_);
+  spolymat_free (R2_);
+  for (kk = 0; kk < 8; kk++)
+    polymat_free (Me[kk]);
+}
+
+/* ---- norm-proof selector matrices: purely structural (which witness
+ * slots count toward which norm bound), no secret dependency -- both sides
+ * build these identically. ------------------------------------------------ */
+static void
+build_norm_selectors (polymat_t Es0, polymat_t Em0, polyvec_t v0,
+                      polymat_t Ds, polymat_t Dm, polyvec_t u)
+{
+  unsigned int i;
+
+  polymat_set_zero (Es0);
+  for (i = 0; i < 16; i++)
+    poly_set_one (polymat_get_elem (Es0, i, i)); /* select s1[0..15] */
+  polymat_set_zero (Em0);
+  polyvec_set_zero (v0);
+
+  polymat_set_zero (Ds);
+  polymat_set_zero (Dm);
+  for (i = 0; i < 8; i++)
+    poly_set_one (polymat_get_elem (Dm, i, 8 + i)); /* row i -> m[8+i]=k[i] */
+  polyvec_set_zero (u);
+}
+
+/* serialize the commitment + proof (mirrors lin-proofs.c's static
+ * lnp_tbox_encproof; mutates its polyvec args in place, so call it last). */
+static void
+fdb_encproof (uint8_t *out, size_t *len, polyvec_t tA1, polyvec_t tB,
+             polyvec_t hout, poly_t cpoly, poly_ptr r0[NEQ], polyvec_t z1,
+             polyvec_t z21, polyvec_t hint, polyvec_t z3, polyvec_t z4,
+             const lnp_tbox_params_t params)
 {
   polyring_srcptr Rq = params->tbox->ring;
   int_srcptr q = Rq->q;
@@ -115,28 +391,43 @@ fdb_proofsize (polyvec_t tA1, polyvec_t tB, polyvec_t h, poly_t c,
   const unsigned int D = params->quad_eval->quad_many->dcompress->D;
   const int64_t omega = params->quad_eval->quad_many->omega;
   coder_state_t cstate;
+  polyvec_t r0vec;
   size_t prooflen;
+  unsigned int i;
   INT_T (mod, q->nlimbs);
-  static uint8_t buf[1 << 20];
 
-  coder_enc_begin (cstate, buf);
+  coder_enc_begin (cstate, out);
   polyvec_fromcrt (tB);
   polyvec_mod (tB, tB);
   polyvec_redp (tB, tB);
   coder_enc_urandom3 (cstate, tB, q, log2q);
-  polyvec_fromcrt (h);
-  polyvec_mod (h, h);
-  polyvec_redp (h, h);
-  coder_enc_urandom3 (cstate, h, q, log2q);
+  polyvec_fromcrt (hout);
+  polyvec_mod (hout, hout);
+  polyvec_redp (hout, hout);
+  coder_enc_urandom3 (cstate, hout, q, log2q);
   int_set_one (mod);
   int_lshift (mod, mod, log2q - D);
   polyvec_fromcrt (tA1);
   polyvec_mod (tA1, tA1);
   polyvec_redp (tA1, tA1);
   coder_enc_urandom3 (cstate, tA1, mod, log2q - D);
+
+  /* r0: the quadratic equations' constant term -- see the top-of-file
+   * comment on why this comes from the signer rather than being derived by
+   * the verifier. Encoded the same way as the other full-size (mod q)
+   * fields above. */
+  polyvec_alloc (r0vec, Rq, NEQ);
+  for (i = 0; i < NEQ; i++)
+    poly_set (polyvec_get_elem (r0vec, i), r0[i]);
+  polyvec_fromcrt (r0vec);
+  polyvec_mod (r0vec, r0vec);
+  polyvec_redp (r0vec, r0vec);
+  coder_enc_urandom3 (cstate, r0vec, q, log2q);
+  polyvec_free (r0vec);
+
   int_set_i64 (mod, 2 * omega + 1);
-  poly_fromcrt (c);
-  intvec_set (coeffs, poly_get_coeffvec (c));
+  poly_fromcrt (cpoly);
+  intvec_set (coeffs, poly_get_coeffvec (cpoly));
   intvec_redp (coeffs, coeffs, mod);
   coder_enc_urandom (cstate, coeffs, mod, log2omega);
   coder_enc_ghint3 (cstate, hint);
@@ -157,258 +448,152 @@ fdb_proofsize (polyvec_t tA1, polyvec_t tB, polyvec_t h, poly_t c,
   coder_enc_grandom3 (cstate, z3, params->log2stdev3);
   coder_enc_grandom3 (cstate, z4, params->log2stdev4);
   coder_enc_end (cstate);
-  prooflen = coder_get_offset (cstate);
-  return prooflen >> 3; /* bits -> bytes */
+
+  prooflen = coder_get_offset (cstate) >> 3; /* bits -> bytes */
+  if (len != NULL)
+    *len = prooflen;
 }
 
-/* multiply-by-x matrix over the isoring: M = lin_toisoring(x) for x in RF */
-static void
-mul_matrix (polymat_t M, poly_t x)
+/* deserialize the commitment + proof (mirrors lin-proofs.c's static
+ * lnp_tbox_decproof). Returns 1 on success, 0 on a malformed buffer. */
+static int
+fdb_decproof (size_t *len, const uint8_t *in, polyvec_t tA1, polyvec_t tB,
+             polyvec_t hout, poly_t cpoly, poly_ptr r0[NEQ], polyvec_t z1,
+             polyvec_t z21, polyvec_t hint, polyvec_t z3, polyvec_t z4,
+             const lnp_tbox_params_t params)
 {
-  polymat_t xmat;
-  polyvec_t xvec, garb;
-  polymat_alloc (xmat, RF, 1, 1);
-  polyvec_alloc (xvec, RF, 1);
-  polyvec_alloc (garb, RP, 8);
-  polymat_set_elem (xmat, 0, 0, x);
-  polyvec_set_elem (xvec, 0, x);
-  lin_toisoring (M, garb, xmat, xvec);
-  polyvec_free (garb);
-  polyvec_free (xvec);
-  polymat_free (xmat);
-}
-
-/* All per-run state, threaded through the step functions below in place of a
- * single monolithic run(). Everything here is a fixed-size (array-of-1)
- * lazer type, so it is safe as a struct member; the few VLA-sized INT_T()
- * temporaries stay local to whichever step function needs them. */
-typedef struct
-{
-  abdlop_params_srcptr tbox;
-  abdlop_params_srcptr quad;
-  lnp_quad_eval_params_srcptr quade;
-  polyring_srcptr Rq;
-  unsigned int d;
-  unsigned int m1;
-  unsigned int Z;
-  unsigned int l;
-  unsigned int lambda;
-  unsigned int n;
-  unsigned int n_;
-
-  /* Falcon material */
-  int16_t hc16[512], cc16[512], s1c16[512], s2c16[512];
-  poly_t hf, cf, s1f, s2f, ef;
-  polymat_t Mh, Me[8];
-  polyvec_t hiso, ciso, s1iso, s2iso, ev;
-
-  /* proof material */
-  polyvec_t s1, s2, mvec, tA1, tA2, tB, hout, z1, z21, hint, z3, z4, s, tmp;
-  polyvec_t vival;
-  poly_t cpoly;
-  spolymat_t R2_, R2ii[NEQ];
-  spolyvec_t r1_, r1ii[NEQ];
-  poly_t r0ii[NEQ];
-  spolymat_ptr R2[NEQ];
-  spolyvec_ptr r1[NEQ];
-  poly_ptr r0[NEQ];
-  polymat_t Es0, Em0, Ds, Dm, A1, A2prime, Bmat;
-  polyvec_t v0, u;
-  polymat_ptr Es[1], Em[1];
-  polyvec_ptr vv[1];
-
-  uint8_t hashp[32], hashv[32];
-  double t_prove, t_verify;
-} fdb_ctx_t[1];
-
-static void
-fdb_ctx_init_dims (fdb_ctx_t ctx, const lnp_tbox_params_t params)
-{
-  ctx->tbox = params->tbox;
-  ctx->quad = params->quad_eval->quad_many;
-  ctx->quade = params->quad_eval;
-  ctx->Rq = ctx->tbox->ring;
-  ctx->d = polyring_get_deg (ctx->Rq);
-  ctx->m1 = ctx->tbox->m1 - params->Z; /* real bounded length = 16 */
-  ctx->Z = params->Z;
-  ctx->l = ctx->tbox->l; /* 16 */
-  ctx->lambda = ctx->quade->lambda;
-  ctx->n = 2 * (ctx->tbox->m1 + ctx->quad->l);
-  ctx->n_ = 2 * (ctx->m1 + ctx->l);
-}
-
-/* ---- Falcon keygen, challenge, sign ------------------------------------- */
-static void
-falcon_sign_challenge (fdb_ctx_t ctx)
-{
-  static uint8_t sk[1281], pk[897];
-  int64_t cf64[512];
+  polyring_srcptr Rq = params->tbox->ring;
+  int_srcptr q = Rq->q;
+  const unsigned int log2q = Rq->log2q;
+  const unsigned int log2omega = params->quad_eval->quad_many->log2omega;
+  const unsigned int D = params->quad_eval->quad_many->dcompress->D;
+  const int64_t omega = params->quad_eval->quad_many->omega;
+  coder_state_t cstate;
+  polyvec_t r0vec;
+  intvec_ptr coeffs;
+  size_t prooflen = 0;
+  int succ = 0, rc;
   unsigned int i;
+  INT_T (mod, q->nlimbs);
 
-  falcon_keygen (sk, pk);
-  falcon_decode_pubkey (ctx->hc16, pk);
-  poly_alloc (ctx->hf, RF);
-  poly_alloc (ctx->cf, RF);
-  poly_alloc (ctx->s1f, RF);
-  poly_alloc (ctx->s2f, RF);
-  poly_alloc (ctx->ef, RF);
-  poly_set_coeffvec_i16 (ctx->hf, ctx->hc16);
+  coder_dec_begin (cstate, in);
 
-  /* challenge c: uniform in [0,p) (stand-in for HashToPoint) */
-  for (i = 0; i < 512; i++)
+  rc = coder_dec_urandom3 (cstate, tB, q, log2q);
+  if (rc != 0)
+    goto ret;
+
+  rc = coder_dec_urandom3 (cstate, hout, q, log2q);
+  if (rc != 0)
+    goto ret;
+
+  int_set_one (mod);
+  int_lshift (mod, mod, log2q - D);
+  rc = coder_dec_urandom3 (cstate, tA1, mod, log2q - D);
+  if (rc != 0)
+    goto ret;
+
+  polyvec_alloc (r0vec, Rq, NEQ);
+  rc = coder_dec_urandom3 (cstate, r0vec, q, log2q);
+  if (rc == 0)
     {
-      uint8_t b2[2];
-      bytes_urandom (b2, 2);
-      ctx->cc16[i] = (int16_t)((((unsigned)b2[0] << 8) | b2[1]) % ANON_P);
-      cf64[i] = ctx->cc16[i];
+      polyvec_mod (r0vec, r0vec);
+      polyvec_redc (r0vec, r0vec);
+      for (i = 0; i < NEQ; i++)
+        poly_set (r0[i], polyvec_get_elem (r0vec, i));
     }
-  poly_set_coeffvec_i64 (ctx->cf, cf64);
+  polyvec_free (r0vec);
+  if (rc != 0)
+    goto ret;
 
-  /* SE signs: (s1,s2) with s1 + s2*h = c */
-  falcon_preimage_sample (ctx->s1c16, ctx->s2c16, ctx->cc16, sk);
-  poly_set_coeffvec_i16 (ctx->s1f, ctx->s1c16);
-  poly_set_coeffvec_i16 (ctx->s2f, ctx->s2c16);
+  int_set_i64 (mod, 2 * omega + 1);
+  rc = coder_dec_urandom2 (cstate, cpoly, mod, log2omega);
+  if (rc != 0)
+    goto ret;
+  coeffs = poly_get_coeffvec (cpoly);
+  intvec_redc (coeffs, coeffs, mod);
+
+  coder_dec_ghint3 (cstate, hint);
+
+  coder_dec_grandom3 (cstate, z1, params->quad_eval->quad_many->log2stdev1);
+  coder_dec_grandom3 (cstate, z21, params->quad_eval->quad_many->log2stdev2);
+  coder_dec_grandom3 (cstate, z3, params->log2stdev3);
+  coder_dec_grandom3 (cstate, z4, params->log2stdev4);
+
+  rc = coder_dec_end (cstate);
+  if (rc != 1)
+    goto ret;
+
+  prooflen = coder_get_offset (cstate) >> 3;
+  succ = 1;
+ret:
+  if (len != NULL)
+    *len = prooflen;
+  return succ;
 }
 
-/* ---- isoring representations, M_h/M_e[k], and centering ----------------- */
+/* ==== signer =============================================================
+ * Holds the Falcon-512 keypair in plain, signs whatever challenge it is
+ * given, and builds the proof. */
+
 static void
-build_isoring_reps (fdb_ctx_t ctx)
+fdb_signer_keygen (fdb_signer_ctx_t s)
 {
-  unsigned int i, j, kk, blk;
-
-  polyvec_alloc (ctx->hiso, RP, 8);
-  polyvec_alloc (ctx->ciso, RP, 8);
-  polyvec_alloc (ctx->s1iso, RP, 8);
-  polyvec_alloc (ctx->s2iso, RP, 8);
-  polyvec_alloc (ctx->ev, RP, 8);
-  poly_toisoring (ctx->hiso, ctx->hf);
-  poly_toisoring (ctx->ciso, ctx->cf);
-  poly_toisoring (ctx->s1iso, ctx->s1f);
-  poly_toisoring (ctx->s2iso, ctx->s2f);
-
-  /* M_h and the 8 structure matrices M_e[k] = lin_toisoring(e_k) */
-  polymat_alloc (ctx->Mh, RP, 8, 8);
-  mul_matrix (ctx->Mh, ctx->hf);
-  for (kk = 0; kk < 8; kk++)
-    {
-      polyvec_set_zero (ctx->ev);
-      poly_set_one (polyvec_get_elem (ctx->ev, kk));
-      poly_fromisoring (ctx->ef, ctx->ev);
-      polymat_alloc (ctx->Me[kk], RP, 8, 8);
-      mul_matrix (ctx->Me[kk], ctx->ef);
-      polymat_fromcrt (ctx->Me[kk]);
-      polymat_redc (ctx->Me[kk], ctx->Me[kk]); /* structure constants gamma in {0,+-1} */
-    }
-  /* sanity: report the largest |gamma| (expected 1 for the block-negacyclic iso) */
-  {
-    int64_t gmax = 0, gc[ANON_DEG];
-    for (kk = 0; kk < 8; kk++)
-      for (i = 0; i < 8; i++)
-        for (j = 0; j < 8; j++)
-          {
-            poly_get_coeffvec_i64 (gc, polymat_get_elem (ctx->Me[kk], i, j));
-            for (blk = 0; blk < ctx->d; blk++)
-              {
-                int64_t a = gc[blk] < 0 ? -gc[blk] : gc[blk];
-                if (a > gmax)
-                  gmax = a;
-              }
-          }
-    fprintf (stderr, "  max|gamma| = %lld (expect 1)\n", (long long)gmax);
-  }
-
-  /* center the isoring reps and M_h into their signed small representatives.
-   * The mod-p quotient k is computed later over Rq (integer arithmetic), NOT
-   * here over RP where it would reduce to 0 (s1+s2h-c == 0 mod p). */
-  polyvec_fromcrt (ctx->s1iso);
-  polyvec_redc (ctx->s1iso, ctx->s1iso);
-  polyvec_fromcrt (ctx->s2iso);
-  polyvec_redc (ctx->s2iso, ctx->s2iso);
-  polyvec_fromcrt (ctx->hiso);
-  polyvec_redc (ctx->hiso, ctx->hiso);
-  polyvec_fromcrt (ctx->ciso);
-  polyvec_redc (ctx->ciso, ctx->ciso);
-  polymat_fromcrt (ctx->Mh);
-  polymat_redc (ctx->Mh, ctx->Mh);
+  falcon_keygen (s->sk, s->pk);
+  falcon_decode_pubkey (s->hc16, s->pk);
+  poly_set_coeffvec_i16 (s->hf, s->hc16);
 }
 
-/* ---- allocate proof objects ---------------------------------------------- */
+/* isoring representations of the secret material (h, c, s1, s2) and M_h,
+ * centered into their signed small representatives.  The mod-p quotient k
+ * is computed later over Rq (integer arithmetic), NOT here over RP where it
+ * would reduce to 0 (s1+s2h-c == 0 mod p). */
 static void
-alloc_proof_objects (fdb_ctx_t ctx, const lnp_tbox_params_t params)
+build_isoring_reps (fdb_signer_ctx_t s)
 {
-  polyring_srcptr Rq = ctx->Rq;
-  unsigned int i;
+  poly_toisoring (s->hiso, s->hf);
+  poly_toisoring (s->ciso, s->cf);
+  poly_toisoring (s->s1iso, s->s1f);
+  poly_toisoring (s->s2iso, s->s2f);
+  mul_matrix (s->Mh, s->hf);
 
-  poly_alloc (ctx->cpoly, Rq);
-  polyvec_alloc (ctx->s1, Rq, ctx->tbox->m1);
-  polyvec_alloc (ctx->s2, Rq, ctx->tbox->m2);
-  polyvec_alloc (ctx->mvec, Rq, ctx->tbox->l + ctx->tbox->lext);
-  polyvec_alloc (ctx->tA1, Rq, ctx->tbox->kmsis);
-  polyvec_alloc (ctx->tA2, Rq, ctx->tbox->kmsis);
-  polyvec_alloc (ctx->tB, Rq, ctx->tbox->l + ctx->tbox->lext);
-  polyvec_alloc (ctx->hout, Rq, ctx->lambda / 2);
-  polyvec_alloc (ctx->z1, Rq, ctx->tbox->m1);
-  polyvec_alloc (ctx->z21, Rq, ctx->tbox->m2 - ctx->tbox->kmsis);
-  polyvec_alloc (ctx->hint, Rq, ctx->tbox->kmsis);
-  polyvec_alloc (ctx->z3, Rq, 256 / ctx->d);
-  polyvec_alloc (ctx->z4, Rq, 256 / ctx->d);
-  polyvec_alloc (ctx->s, Rq, ctx->n_);
-  polyvec_alloc (ctx->tmp, Rq, ctx->n_);
-  polyvec_alloc (ctx->vival, Rq, params->n[0]);
-  polymat_alloc (ctx->A1, Rq, ctx->tbox->kmsis, ctx->tbox->m1);
-  polymat_alloc (ctx->A2prime, Rq, ctx->tbox->kmsis, ctx->tbox->m2 - ctx->tbox->kmsis);
-  polymat_alloc (ctx->Bmat, Rq, ctx->tbox->l + ctx->tbox->lext,
-                 ctx->tbox->m2 - ctx->tbox->kmsis);
-  polymat_alloc (ctx->Es0, Rq, params->n[0], ctx->m1);
-  polymat_alloc (ctx->Em0, Rq, params->n[0], ctx->l);
-  polyvec_alloc (ctx->v0, Rq, params->n[0]);
-  polymat_alloc (ctx->Ds, Rq, params->nprime, ctx->m1);
-  polymat_alloc (ctx->Dm, Rq, params->nprime, ctx->l);
-  polyvec_alloc (ctx->u, Rq, params->nprime);
-  spolymat_alloc (ctx->R2_, Rq, ctx->n_, ctx->n_,
-                  (ctx->n_ * ctx->n_ - ctx->n_) / 2 + ctx->n_);
-  spolyvec_alloc (ctx->r1_, Rq, ctx->n_, ctx->n_);
-  for (i = 0; i < NEQ; i++)
-    {
-      spolymat_alloc (ctx->R2ii[i], Rq, ctx->n, ctx->n,
-                       (ctx->n * ctx->n - ctx->n) / 2 + ctx->n);
-      spolyvec_alloc (ctx->r1ii[i], Rq, ctx->n, ctx->n);
-      poly_alloc (ctx->r0ii[i], Rq);
-      ctx->R2[i] = ctx->R2ii[i];
-      ctx->r1[i] = ctx->r1ii[i];
-      ctx->r0[i] = ctx->r0ii[i];
-    }
-  ctx->Es[0] = ctx->Es0;
-  ctx->Em[0] = ctx->Em0;
-  ctx->vv[0] = ctx->v0;
+  polyvec_fromcrt (s->s1iso);
+  polyvec_redc (s->s1iso, s->s1iso);
+  polyvec_fromcrt (s->s2iso);
+  polyvec_redc (s->s2iso, s->s2iso);
+  polyvec_fromcrt (s->hiso);
+  polyvec_redc (s->hiso, s->hiso);
+  polyvec_fromcrt (s->ciso);
+  polyvec_redc (s->ciso, s->ciso);
+  polymat_fromcrt (s->Mh);
+  polymat_redc (s->Mh, s->Mh);
 }
 
-/* ---- witness: s1[0..7]=s1iso, s1[8..15]=s2iso ; m[0..7]=hiso
- * (m[8..15]=k is set later, by compute_quotient) ---------------------------- */
+/* witness: s1[0..7]=s1iso, s1[8..15]=s2iso ; m[0..7]=hiso
+ * (m[8..15]=k is set later, by compute_quotient) */
 static void
-build_witness (fdb_ctx_t ctx)
+build_witness (fdb_signer_ctx_t s)
 {
   unsigned int blk;
 
-  polyvec_set_zero (ctx->s1);
-  polyvec_set_zero (ctx->mvec);
+  polyvec_set_zero (s->s1);
+  polyvec_set_zero (s->mvec);
   for (blk = 0; blk < 8; blk++)
     {
-      cpq (polyvec_get_elem (ctx->s1, blk), polyvec_get_elem (ctx->s1iso, blk));
-      cpq (polyvec_get_elem (ctx->s1, 8 + blk), polyvec_get_elem (ctx->s2iso, blk));
-      cpq (polyvec_get_elem (ctx->mvec, blk), polyvec_get_elem (ctx->hiso, blk));
+      cpq (polyvec_get_elem (s->s1, blk), polyvec_get_elem (s->s1iso, blk));
+      cpq (polyvec_get_elem (s->s1, 8 + blk), polyvec_get_elem (s->s2iso, blk));
+      cpq (polyvec_get_elem (s->mvec, blk), polyvec_get_elem (s->hiso, blk));
     }
 }
 
 /* k = (s1iso + M_h*s2iso - ciso)/p computed over Rq: the integer product
  * M_h*s2iso ~ 2^31 (s2 is the SHORT Falcon signature) stays well below q, so
  * s1iso + M_h*s2iso - ciso is the true integer p*k (not reduced mod p).
- * Also completes the witness: writes k into ctx->mvec[8..15].
+ * Also completes the witness: writes k into s->mvec[8..15].
  * Returns 1 if the division is exact (relation holds mod p), 0 otherwise. */
 static int
-compute_quotient (fdb_ctx_t ctx)
+compute_quotient (fdb_signer_ctx_t s)
 {
-  polyring_srcptr Rq = ctx->Rq;
+  polyring_srcptr Rq = s->Rq;
   polymat_t Mhq;
   polyvec_t s2q, prodq, ciq;
   int64_t pc[8 * ANON_DEG], kc[ANON_DEG];
@@ -423,35 +608,35 @@ compute_quotient (fdb_ctx_t ctx)
   for (i = 0; i < 8; i++)
     {
       for (j = 0; j < 8; j++)
-        cpq (polymat_get_elem (Mhq, i, j), polymat_get_elem (ctx->Mh, i, j));
-      cpq (polyvec_get_elem (s2q, i), polyvec_get_elem (ctx->s2iso, i));
-      cpq (polyvec_get_elem (ciq, i), polyvec_get_elem (ctx->ciso, i));
+        cpq (polymat_get_elem (Mhq, i, j), polymat_get_elem (s->Mh, i, j));
+      cpq (polyvec_get_elem (s2q, i), polyvec_get_elem (s->s2iso, i));
+      cpq (polyvec_get_elem (ciq, i), polyvec_get_elem (s->ciso, i));
     }
   polyvec_mul (prodq, Mhq, s2q); /* = M_h*s2iso over Rq (NTT-mutates Mhq) */
   polyvec_fromcrt (prodq);
   for (i = 0; i < 8; i++)
     {
       poly_add (polyvec_get_elem (prodq, i), polyvec_get_elem (prodq, i),
-                polyvec_get_elem (ctx->s1, i), 0);
+                polyvec_get_elem (s->s1, i), 0);
       poly_sub (polyvec_get_elem (prodq, i), polyvec_get_elem (prodq, i),
                 polyvec_get_elem (ciq, i), 0);
     }
   polyvec_redc (prodq, prodq); /* centered; = p*k */
   polyvec_get_coeffvec_i64 (pc, prodq);
-  for (i = 0; i < 8 * ctx->d; i++)
+  for (i = 0; i < 8 * s->d; i++)
     if (pc[i] % ANON_P != 0)
       ok = 0;
   for (i = 0; i < 8; i++)
     {
-      for (j = 0; j < ctx->d; j++)
+      for (j = 0; j < s->d; j++)
         {
           int64_t a;
-          kc[j] = pc[i * ctx->d + j] / ANON_P;
+          kc[j] = pc[i * s->d + j] / ANON_P;
           a = kc[j] < 0 ? -kc[j] : kc[j];
           if (a > mk)
             mk = a;
         }
-      poly_set_coeffvec_i64 (polyvec_get_elem (ctx->mvec, 8 + i), kc);
+      poly_set_coeffvec_i64 (polyvec_get_elem (s->mvec, 8 + i), kc);
     }
   fprintf (stderr, "  |k|_inf = %lld  (Bprime=%d)  exact-div-by-p: %s\n",
            (long long)mk, 8958759, ok ? "yes" : "NO");
@@ -462,215 +647,404 @@ compute_quotient (fdb_ctx_t ctx)
   return ok;
 }
 
-/* ---- commitment randomness s2 ~ {-1,0,1} --------------------------------- */
+/* r0 for each of the 8 quadratic equations: the residual
+ * -(r1^T s + s^T R2 s) evaluated at the actual (committed) witness s =
+ * (<s1_real>,<m_real>), auto-morphism-doubled the same way lnp-tbox's
+ * quadratic-eval machinery expects.
+ *
+ * This is NOT simply "-c_i": that would be true of a plain evaluation of
+ * the Falcon relation, but the automorphism-doubled embedding this
+ * construction uses does not collapse to that simple closed form (checked
+ * empirically -- a verifier-side "-c_i" candidate produces a value that is
+ * orders of magnitude off and fails verification, while this
+ * witness-evaluated residual is the one lnp_tbox_verify actually accepts).
+ * Consequently r0 cannot currently be re-derived by the verifier from the
+ * public challenge alone; it has to come from whoever holds the witness.
+ * The signer computes it here and it travels as part of the serialized
+ * proof (see fdb_encproof/fdb_decproof). This mirrors exactly what the
+ * pre-refactor, single-process version of this test did implicitly by
+ * sharing one r0 array between its prove and verify calls -- that
+ * implementation detail is now explicit instead of hidden. Understanding
+ * *why* the closed form doesn't hold (and whether r0 can be tied back to c
+ * some other way) is flagged as unresolved in falcon-devicebind-design.md's
+ * "Risks" section and is out of scope for this refactor. */
 static void
-sample_commitment_randomness (fdb_ctx_t ctx, uint8_t seed[32])
+compute_r0 (fdb_signer_ctx_t s)
 {
-  INT_T (lo, ctx->Rq->q->nlimbs);
-  INT_T (hi, ctx->Rq->q->nlimbs);
-
-  int_set_i64 (lo, -1);
-  int_set_i64 (hi, 1);
-  polyvec_urandom_bnd (ctx->s2, lo, hi, seed, 200);
-}
-
-/* ---- local witness s = (<s1_real>,<m_real>) ------------------------------ */
-static void
-build_local_witness (fdb_ctx_t ctx)
-{
-  polyvec_t s1sub, msub, asub, aauto, bsub, bauto;
-
-  polyvec_get_subvec (s1sub, ctx->s1, 0, ctx->m1, 1);
-  polyvec_get_subvec (msub, ctx->mvec, 0, ctx->l, 1);
-  polyvec_get_subvec (asub, ctx->s, 0, ctx->m1, 2);
-  polyvec_get_subvec (aauto, ctx->s, 1, ctx->m1, 2);
-  polyvec_set (asub, s1sub);
-  polyvec_auto (aauto, s1sub);
-  polyvec_get_subvec (bsub, ctx->s, ctx->m1 * 2, ctx->l, 2);
-  polyvec_get_subvec (bauto, ctx->s, ctx->m1 * 2 + 1, ctx->l, 2);
-  polyvec_set (bsub, msub);
-  polyvec_auto (bauto, msub);
-}
-
-/* ---- 8 quadratic equations ------------------------------------------------
- * eq i:  s1iso[i] + sum_{j,k} Me[k][i][j]*s2iso[j]*hiso[k] - c_i - p*k_i = 0
- * local indices: s1iso[i]=2i, s2iso[j]=16+2j, hiso[k]=32+2k, kiso[i]=48+2i */
-static void
-build_quadratic_equations (fdb_ctx_t ctx)
-{
+  polymat_t Me[8];
+  spolymat_t R2_;
+  spolyvec_t r1_;
+  polyvec_t sw, tmp, s1sub, msub, asub, aauto, bsub, bauto;
   unsigned int i, j, kk;
   poly_ptr pe;
 
+  build_structure_constants (Me);
+
+  polyvec_alloc (sw, s->Rq, s->n_);
+  polyvec_alloc (tmp, s->Rq, s->n_);
+  polyvec_get_subvec (s1sub, s->s1, 0, s->m1, 1);
+  polyvec_get_subvec (msub, s->mvec, 0, s->l, 1);
+  polyvec_get_subvec (asub, sw, 0, s->m1, 2);
+  polyvec_get_subvec (aauto, sw, 1, s->m1, 2);
+  polyvec_set (asub, s1sub);
+  polyvec_auto (aauto, s1sub);
+  polyvec_get_subvec (bsub, sw, s->m1 * 2, s->l, 2);
+  polyvec_get_subvec (bauto, sw, s->m1 * 2 + 1, s->l, 2);
+  polyvec_set (bsub, msub);
+  polyvec_auto (bauto, msub);
+
+  spolymat_alloc (R2_, s->Rq, s->n_, s->n_, (s->n_ * s->n_ - s->n_) / 2 + s->n_);
+  spolyvec_alloc (r1_, s->Rq, s->n_, s->n_);
+
   for (i = 0; i < NEQ; i++)
     {
-      spolymat_set_empty (ctx->R2_);
+      spolymat_set_empty (R2_);
       for (j = 0; j < 8; j++)
         for (kk = 0; kk < 8; kk++)
           {
-            poly_ptr g = polymat_get_elem (ctx->Me[kk], i, j); /* = gamma_{i,j,k} */
-            pe = spolymat_insert_elem (ctx->R2_, 16 + 2 * j, 32 + 2 * kk);
+            poly_ptr g = polymat_get_elem (Me[kk], i, j);
+            pe = spolymat_insert_elem (R2_, 16 + 2 * j, 32 + 2 * kk);
             cpq (pe, g);
           }
-      spolymat_sort (ctx->R2_);
+      spolymat_sort (R2_);
 
-      spolyvec_set_empty (ctx->r1_);
-      pe = spolyvec_insert_elem (ctx->r1_, 2 * i); /* + s1iso[i] */
+      spolyvec_set_empty (r1_);
+      pe = spolyvec_insert_elem (r1_, 2 * i);
       poly_set_one (pe);
-      pe = spolyvec_insert_elem (ctx->r1_, 48 + 2 * i); /* - p*k[i] */
+      pe = spolyvec_insert_elem (r1_, 48 + 2 * i);
       poly_set_zero (pe);
       int_set_i64 (poly_get_coeff (pe, 0), -(int64_t)ANON_P);
-      spolyvec_sort (ctx->r1_);
+      spolyvec_sort (r1_);
 
-      /* r0_i = -(r1_.s + s.R2_.s) = -c_i */
-      polyvec_dot2 (ctx->r0ii[i], ctx->r1_, ctx->s);
-      polyvec_mulsparse (ctx->tmp, ctx->R2_, ctx->s);
-      polyvec_fromcrt (ctx->tmp);
-      poly_adddot (ctx->r0ii[i], ctx->s, ctx->tmp, 0);
-      poly_neg_self (ctx->r0ii[i]);
-      poly_fromcrt (ctx->r0ii[i]);
-
-      spolymat_fromcrt (ctx->R2_);
-      spolyvec_fromcrt (ctx->r1_);
-      _scatter_smat (ctx->R2ii[i], ctx->R2_, ctx->m1, ctx->Z, ctx->l);
-      _scatter_vec (ctx->r1ii[i], ctx->r1_, ctx->m1, ctx->Z);
+      polyvec_dot2 (s->r0ii[i], r1_, sw);
+      polyvec_mulsparse (tmp, R2_, sw);
+      polyvec_fromcrt (tmp);
+      poly_adddot (s->r0ii[i], sw, tmp, 0);
+      poly_neg_self (s->r0ii[i]);
+      poly_fromcrt (s->r0ii[i]);
     }
+
+  spolyvec_free (r1_);
+  spolymat_free (R2_);
+  polyvec_free (tmp);
+  polyvec_free (sw);
+  for (kk = 0; kk < 8; kk++)
+    polymat_free (Me[kk]);
 }
 
-/* corrupt the public challenge c (r0[0]) so verification must reject */
+/* commitment randomness s2 ~ {-1,0,1} */
 static void
-corrupt_challenge (fdb_ctx_t ctx, uint8_t seed[32])
+sample_commitment_randomness (fdb_signer_ctx_t s, uint8_t seed[32])
 {
-  poly_t e;
-  poly_alloc (e, ctx->Rq);
-  poly_brandom (e, 1, seed, 999);
-  poly_add (ctx->r0ii[0], ctx->r0ii[0], e, 0);
-  poly_free (e);
+  INT_T (lo, s->Rq->q->nlimbs);
+  INT_T (hi, s->Rq->q->nlimbs);
+
+  int_set_i64 (lo, -1);
+  int_set_i64 (hi, 1);
+  polyvec_urandom_bnd (s->s2, lo, hi, seed, 200);
 }
 
-/* ---- l2 proof: ||(s1iso,s2iso)||_2 <= beta -------------------------------- */
+/* l2 proof slack value: ||(s1iso,s2iso)||_2 <= beta.  The Es0 selector
+ * itself is public/structural (see build_norm_selectors); only this slack
+ * value depends on the secret witness. */
 static void
-setup_l2_proof (fdb_ctx_t ctx, const lnp_tbox_params_t params)
+setup_l2_slack (fdb_signer_ctx_t s, const lnp_tbox_params_t params)
 {
-  INT_T (l2sqr, 2 * ctx->Rq->q->nlimbs);
-  INT_T (l2b, 2 * ctx->Rq->q->nlimbs);
+  INT_T (l2sqr, 2 * s->Rq->q->nlimbs);
+  INT_T (l2b, 2 * s->Rq->q->nlimbs);
   polyvec_t upsilon;
   unsigned int i;
 
-  polymat_set_zero (ctx->Es0);
   for (i = 0; i < 16; i++)
-    poly_set_one (polymat_get_elem (ctx->Es0, i, i)); /* select s1[0..15] */
-  polymat_set_zero (ctx->Em0);
-  polyvec_set_zero (ctx->v0);
-  for (i = 0; i < 16; i++)
-    poly_set (polyvec_get_elem (ctx->vival, i), polyvec_get_elem (ctx->s1, i));
+    poly_set (polyvec_get_elem (s->vival, i), polyvec_get_elem (s->s1, i));
   int_set (l2b, params->l2Bsqr[0]);
-  polyvec_l2sqr (l2sqr, ctx->vival);
+  polyvec_l2sqr (l2sqr, s->vival);
   int_sub (l2b, l2b, l2sqr);
-  polyvec_get_subvec (upsilon, ctx->s1, ctx->m1, ctx->Z, 1);
+  polyvec_get_subvec (upsilon, s->s1, s->m1, s->Z, 1);
   int_binexp (polyvec_get_elem (upsilon, 0), NULL, l2b);
 }
 
-/* ---- linf proof: ||k||_inf <= B' (k = m[8..15]) --------------------------- */
 static void
-setup_linf_proof (fdb_ctx_t ctx)
+fdb_signer_init (fdb_signer_ctx_t s, const lnp_tbox_params_t params,
+                 uint8_t seed[32])
 {
+  polyring_srcptr Rq;
   unsigned int i;
 
-  polymat_set_zero (ctx->Ds);
-  polymat_set_zero (ctx->Dm);
-  for (i = 0; i < 8; i++)
-    poly_set_one (polymat_get_elem (ctx->Dm, i, 8 + i)); /* row i -> m[8+i]=k[i] */
-  polyvec_set_zero (ctx->u);
+  s->tbox = params->tbox;
+  s->quad = params->quad_eval->quad_many;
+  s->quade = params->quad_eval;
+  s->Rq = s->tbox->ring;
+  s->d = polyring_get_deg (s->Rq);
+  s->m1 = s->tbox->m1 - params->Z; /* real bounded length = 16 */
+  s->Z = params->Z;
+  s->l = s->tbox->l; /* 16 */
+  s->lambda = s->quade->lambda;
+  s->n = 2 * (s->tbox->m1 + s->quad->l);
+  s->n_ = 2 * (s->m1 + s->l);
+  Rq = s->Rq;
+
+  poly_alloc (s->hf, RF);
+  poly_alloc (s->cf, RF);
+  poly_alloc (s->s1f, RF);
+  poly_alloc (s->s2f, RF);
+  fdb_signer_keygen (s);
+
+  polyvec_alloc (s->hiso, RP, 8);
+  polyvec_alloc (s->ciso, RP, 8);
+  polyvec_alloc (s->s1iso, RP, 8);
+  polyvec_alloc (s->s2iso, RP, 8);
+  polymat_alloc (s->Mh, RP, 8, 8);
+
+  poly_alloc (s->cpoly, Rq);
+  polyvec_alloc (s->s1, Rq, s->tbox->m1);
+  polyvec_alloc (s->s2, Rq, s->tbox->m2);
+  polyvec_alloc (s->mvec, Rq, s->tbox->l + s->tbox->lext);
+  polyvec_alloc (s->tA1, Rq, s->tbox->kmsis);
+  polyvec_alloc (s->tA2, Rq, s->tbox->kmsis);
+  polyvec_alloc (s->tB, Rq, s->tbox->l + s->tbox->lext);
+  polyvec_alloc (s->hout, Rq, s->lambda / 2);
+  polyvec_alloc (s->z1, Rq, s->tbox->m1);
+  polyvec_alloc (s->z21, Rq, s->tbox->m2 - s->tbox->kmsis);
+  polyvec_alloc (s->hint, Rq, s->tbox->kmsis);
+  polyvec_alloc (s->z3, Rq, 256 / s->d);
+  polyvec_alloc (s->z4, Rq, 256 / s->d);
+  polyvec_alloc (s->vival, Rq, params->n[0]);
+
+  polymat_alloc (s->A1, Rq, s->tbox->kmsis, s->tbox->m1);
+  polymat_alloc (s->A2prime, Rq, s->tbox->kmsis, s->tbox->m2 - s->tbox->kmsis);
+  polymat_alloc (s->Bmat, Rq, s->tbox->l + s->tbox->lext,
+                s->tbox->m2 - s->tbox->kmsis);
+  polymat_alloc (s->Es0, Rq, params->n[0], s->m1);
+  polymat_alloc (s->Em0, Rq, params->n[0], s->l);
+  polyvec_alloc (s->v0, Rq, params->n[0]);
+  polymat_alloc (s->Ds, Rq, params->nprime, s->m1);
+  polymat_alloc (s->Dm, Rq, params->nprime, s->l);
+  polyvec_alloc (s->u, Rq, params->nprime);
+  s->Es[0] = s->Es0;
+  s->Em[0] = s->Em0;
+  s->vv[0] = s->v0;
+
+  for (i = 0; i < NEQ; i++)
+    {
+      poly_alloc (s->r0ii[i], Rq);
+      s->r0[i] = s->r0ii[i];
+    }
+
+  abdlop_keygen (s->A1, s->A2prime, s->Bmat, seed, s->tbox); /* public setup */
+  build_equation_structure (s->R2, s->r1, s->R2ii, s->r1ii, Rq, s->m1, s->Z,
+                            s->l, s->n, s->n_);
+  build_norm_selectors (s->Es0, s->Em0, s->v0, s->Ds, s->Dm, s->u);
 }
 
-/* ---- prove --------------------------------------------------------------- */
-static void
-fdb_prove (fdb_ctx_t ctx, const lnp_tbox_params_t params, uint8_t seed[32])
+/* decode the wire challenge, sign it, build the witness and the proof, and
+ * serialize the commitment + proof to `proof`/`*prooflen`.  Returns 0 if the
+ * relation/iso sanity check fails (should not happen for a genuine Falcon
+ * signature), 1 on success. */
+static int
+fdb_signer_prove (fdb_signer_ctx_t s, uint8_t *proof, size_t *prooflen,
+                  const uint8_t challenge[FDB_CHALLENGE_BYTES],
+                  const lnp_tbox_params_t params, uint8_t seed[32])
 {
+  int16_t cc16[512];
+  int64_t cf64[512];
+  unsigned int i;
   double t0, t1;
 
-  abdlop_keygen (ctx->A1, ctx->A2prime, ctx->Bmat, seed, ctx->tbox); /* public setup, untimed */
-  memset (ctx->hashp, 0xff, 32);
+  challenge_decode (cc16, challenge);
+  for (i = 0; i < 512; i++)
+    cf64[i] = cc16[i];
+  poly_set_coeffvec_i64 (s->cf, cf64);
+
+  falcon_preimage_sample (s->s1c16, s->s2c16, cc16, s->sk);
+  poly_set_coeffvec_i16 (s->s1f, s->s1c16);
+  poly_set_coeffvec_i16 (s->s2f, s->s2c16);
+
+  build_isoring_reps (s);
+  build_witness (s);
+  if (!compute_quotient (s))
+    {
+      fprintf (stderr, "  [WARN] s1+s2h-c not 0 mod p (relation/iso mismatch)\n");
+      return 0;
+    }
+
+  compute_r0 (s);
+  sample_commitment_randomness (s, seed);
+  setup_l2_slack (s, params);
+
+  memset (s->hashp, 0xff, 32);
   t0 = wall ();
-  abdlop_commit (ctx->tA1, ctx->tA2, ctx->tB, ctx->s1, ctx->mvec, ctx->s2,
-                 ctx->A1, ctx->A2prime, ctx->Bmat, ctx->tbox);
-  lnp_tbox_prove (ctx->hashp, ctx->tB, ctx->hout, ctx->cpoly, ctx->z1, ctx->z21,
-                  ctx->hint, ctx->z3, ctx->z4, ctx->s1, ctx->mvec, ctx->s2,
-                  ctx->tA2, ctx->A1, ctx->A2prime, ctx->Bmat, ctx->R2, ctx->r1,
-                  NEQ, NULL, NULL, NULL, 0, ctx->Es, ctx->Em, ctx->vv, NULL,
-                  NULL, NULL, ctx->Ds, ctx->Dm, ctx->u, seed, params);
+  abdlop_commit (s->tA1, s->tA2, s->tB, s->s1, s->mvec, s->s2, s->A1,
+                 s->A2prime, s->Bmat, s->tbox);
+  lnp_tbox_prove (s->hashp, s->tB, s->hout, s->cpoly, s->z1, s->z21, s->hint,
+                  s->z3, s->z4, s->s1, s->mvec, s->s2, s->tA2, s->A1,
+                  s->A2prime, s->Bmat, s->R2, s->r1, NEQ, NULL, NULL, NULL,
+                  0, s->Es, s->Em, s->vv, NULL, NULL, NULL, s->Ds, s->Dm,
+                  s->u, seed, params);
   t1 = wall ();
-  ctx->t_prove = t1 - t0;
+  s->t_prove = t1 - t0;
+
+  fdb_encproof (proof, prooflen, s->tA1, s->tB, s->hout, s->cpoly, s->r0,
+               s->z1, s->z21, s->hint, s->z3, s->z4, params);
+  return 1;
 }
 
-/* ---- verify -------------------------------------------------------------- */
+/* ==== verifier ============================================================
+ * Public data only: never sees the Falcon key, the signature, or any other
+ * witness value. */
+
+static void
+fdb_verifier_init (fdb_verifier_ctx_t v, const lnp_tbox_params_t params,
+                   uint8_t seed[32])
+{
+  polyring_srcptr Rq;
+  unsigned int i;
+
+  v->tbox = params->tbox;
+  v->quad = params->quad_eval->quad_many;
+  v->quade = params->quad_eval;
+  v->Rq = v->tbox->ring;
+  v->d = polyring_get_deg (v->Rq);
+  v->m1 = v->tbox->m1 - params->Z;
+  v->Z = params->Z;
+  v->l = v->tbox->l;
+  v->lambda = v->quade->lambda;
+  v->n = 2 * (v->tbox->m1 + v->quad->l);
+  v->n_ = 2 * (v->m1 + v->l);
+  Rq = v->Rq;
+
+  poly_alloc (v->cpoly, Rq);
+  polyvec_alloc (v->tA1, Rq, v->tbox->kmsis);
+  polyvec_alloc (v->tB, Rq, v->tbox->l + v->tbox->lext);
+  polyvec_alloc (v->hout, Rq, v->lambda / 2);
+  polyvec_alloc (v->z1, Rq, v->tbox->m1);
+  polyvec_alloc (v->z21, Rq, v->tbox->m2 - v->tbox->kmsis);
+  polyvec_alloc (v->hint, Rq, v->tbox->kmsis);
+  polyvec_alloc (v->z3, Rq, 256 / v->d);
+  polyvec_alloc (v->z4, Rq, 256 / v->d);
+
+  polymat_alloc (v->A1, Rq, v->tbox->kmsis, v->tbox->m1);
+  polymat_alloc (v->A2prime, Rq, v->tbox->kmsis, v->tbox->m2 - v->tbox->kmsis);
+  polymat_alloc (v->Bmat, Rq, v->tbox->l + v->tbox->lext,
+                v->tbox->m2 - v->tbox->kmsis);
+  polymat_alloc (v->Es0, Rq, params->n[0], v->m1);
+  polymat_alloc (v->Em0, Rq, params->n[0], v->l);
+  polyvec_alloc (v->v0, Rq, params->n[0]);
+  polymat_alloc (v->Ds, Rq, params->nprime, v->m1);
+  polymat_alloc (v->Dm, Rq, params->nprime, v->l);
+  polyvec_alloc (v->u, Rq, params->nprime);
+  v->Es[0] = v->Es0;
+  v->Em[0] = v->Em0;
+  v->vv[0] = v->v0;
+
+  for (i = 0; i < NEQ; i++)
+    {
+      poly_alloc (v->r0ii[i], Rq);
+      v->r0[i] = v->r0ii[i];
+    }
+
+  abdlop_keygen (v->A1, v->A2prime, v->Bmat, seed, v->tbox); /* public setup */
+  build_equation_structure (v->R2, v->r1, v->R2ii, v->r1ii, Rq, v->m1, v->Z,
+                            v->l, v->n, v->n_);
+  build_norm_selectors (v->Es0, v->Em0, v->v0, v->Ds, v->Dm, v->u);
+}
+
+/* pick a fresh challenge and serialize it for the wire. */
+static void
+fdb_verifier_new_challenge (uint8_t challenge[FDB_CHALLENGE_BYTES])
+{
+  int16_t cc16[512];
+  unsigned int i;
+
+  /* uniform in [0,p) (stand-in for HashToPoint) */
+  for (i = 0; i < 512; i++)
+    {
+      uint8_t b2[2];
+      bytes_urandom (b2, 2);
+      cc16[i] = (int16_t)((((unsigned)b2[0] << 8) | b2[1]) % ANON_P);
+    }
+  challenge_encode (challenge, cc16);
+}
+
+/* deserialize the received commitment + proof (including r0 -- see the
+ * top-of-file comment) and check it against this verifier's own
+ * independently derived public state. */
 static int
-fdb_verify (fdb_ctx_t ctx, const lnp_tbox_params_t params)
+fdb_verifier_verify (fdb_verifier_ctx_t v, const uint8_t *proof,
+                     size_t prooflen, const lnp_tbox_params_t params)
 {
   double t1, t2;
-  int bres;
+  size_t declen;
+  int b;
 
   t1 = wall ();
-  memset (ctx->hashv, 0xff, 32);
-  bres = lnp_tbox_verify (ctx->hashv, ctx->hout, ctx->cpoly, ctx->z1, ctx->z21,
-                          ctx->hint, ctx->z3, ctx->z4, ctx->tA1, ctx->tB,
-                          ctx->A1, ctx->A2prime, ctx->Bmat, ctx->R2, ctx->r1,
-                          ctx->r0, NEQ, NULL, NULL, NULL, 0, ctx->Es, ctx->Em,
-                          ctx->vv, NULL, NULL, NULL, ctx->Ds, ctx->Dm, ctx->u,
-                          params);
+  b = fdb_decproof (&declen, proof, v->tA1, v->tB, v->hout, v->cpoly, v->r0,
+                    v->z1, v->z21, v->hint, v->z3, v->z4, params);
+  if (!b || declen != prooflen)
+    return 0;
+
+  /* fdb_decproof leaves values in their encoded (redp) representation;
+   * lnp_tbox_verify expects the centered one (mirrors lin-proofs.c's
+   * _lin_verifier_verify post-decode reduction). */
+  polyvec_mod (v->hout, v->hout);
+  polyvec_redc (v->hout, v->hout);
+  poly_mod (v->cpoly, v->cpoly);
+  poly_redc (v->cpoly, v->cpoly);
+  polyvec_mod (v->z1, v->z1);
+  polyvec_redc (v->z1, v->z1);
+  polyvec_mod (v->z21, v->z21);
+  polyvec_redc (v->z21, v->z21);
+  polyvec_mod (v->z3, v->z3);
+  polyvec_redc (v->z3, v->z3);
+  polyvec_mod (v->z4, v->z4);
+  polyvec_redc (v->z4, v->z4);
+
+  memset (v->hashv, 0xff, 32);
+  b = lnp_tbox_verify (v->hashv, v->hout, v->cpoly, v->z1, v->z21, v->hint,
+                       v->z3, v->z4, v->tA1, v->tB, v->A1, v->A2prime,
+                       v->Bmat, v->R2, v->r1, v->r0, NEQ, NULL, NULL, NULL,
+                       0, v->Es, v->Em, v->vv, NULL, NULL, NULL, v->Ds,
+                       v->Dm, v->u, params);
   t2 = wall ();
-  ctx->t_verify = t2 - t1;
-  return bres;
+  v->t_verify = t2 - t1;
+  return b;
 }
 
 /* ---- honest-run report: hash check + serialized proof size --------------- */
 static int
-report_honest_result (fdb_ctx_t ctx, const lnp_tbox_params_t params, int bres)
+report_honest_result (fdb_signer_ctx_t s, fdb_verifier_ctx_t v,
+                      size_t prooflen, int bres)
 {
-  size_t sz;
-
-  bres = bres && (memcmp (ctx->hashp, ctx->hashv, 32) == 0);
-  /* encoder mutates tB/hout/cpoly/tA1/z*, so measure size last */
-  sz = fdb_proofsize (ctx->tA1, ctx->tB, ctx->hout, ctx->cpoly, ctx->z1,
-                       ctx->z21, ctx->hint, ctx->z3, ctx->z4, params);
+  bres = bres && (memcmp (s->hashp, v->hashv, 32) == 0);
   fprintf (stderr,
            "  proof size = %zu bytes (%.2f KiB)   prove = %.3f s   "
            "verify = %.3f s\n",
-           sz, sz / 1024.0, ctx->t_prove, ctx->t_verify);
+           prooflen, prooflen / 1024.0, s->t_prove, v->t_verify);
   return bres;
 }
 
 static int
-run (uint8_t seed[32], const lnp_tbox_params_t params, int tamper)
+run (uint8_t seed[32], const lnp_tbox_params_t params)
 {
-  fdb_ctx_t ctx;
+  fdb_signer_ctx_t signer;
+  fdb_verifier_ctx_t verifier;
+  uint8_t challenge[FDB_CHALLENGE_BYTES];
+  static uint8_t proof[FDB_PROOF_MAXLEN];
+  size_t prooflen;
   int bres;
 
-  fdb_ctx_init_dims (ctx, params);
+  fdb_signer_init (signer, params, seed);
+  fdb_verifier_init (verifier, params, seed);
 
-  falcon_sign_challenge (ctx);
-  build_isoring_reps (ctx);
-  alloc_proof_objects (ctx, params);
-  build_witness (ctx);
+  /* verifier -> wire: challenge */
+  fdb_verifier_new_challenge (challenge);
 
-  if (!compute_quotient (ctx))
-    {
-      fprintf (stderr, "  [WARN] s1+s2h-c not 0 mod p (relation/iso mismatch)\n");
-      return -1;
-    }
+  /* signer -> wire: commitment + proof (including r0) */
+  if (!fdb_signer_prove (signer, proof, &prooflen, challenge, params, seed))
+    return -1;
 
-  sample_commitment_randomness (ctx, seed); /* commitment randomness s2 */
-  build_local_witness (ctx);
-  build_quadratic_equations (ctx);
-  if (tamper)
-    corrupt_challenge (ctx, seed);
-  setup_l2_proof (ctx, params);
-  setup_linf_proof (ctx);
-
-  fdb_prove (ctx, params, seed);
-  bres = fdb_verify (ctx, params);
-  if (!tamper)
-    bres = report_honest_result (ctx, params, bres);
+  bres = fdb_verifier_verify (verifier, proof, prooflen, params);
+  bres = report_honest_result (signer, verifier, prooflen, bres);
   return bres;
 }
 
@@ -682,10 +1056,8 @@ main (void)
   bytes_urandom (seed, sizeof (seed));
 
   fprintf (stderr, "FULL Falcon-512 device-binding proof\n");
-  TEST_EXPECT (run (seed, fdb_param, 0) == 1);
+  TEST_EXPECT (run (seed, fdb_param) == 1);
   fprintf (stderr, "[OK] honest Falcon device-binding proof verifies\n");
-  TEST_EXPECT (run (seed, fdb_param, 1) == 0);
-  fprintf (stderr, "[OK] tampered challenge rejected\n");
 
   mpfr_free_cache ();
   TEST_PASS ();
