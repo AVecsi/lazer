@@ -28,24 +28,23 @@ wall (void)
  *     the resulting proof (with its ABDLOP commitment) to the verifier.
  *
  *   - the VERIFIER never sees h, the signature, or any other witness value.
- *     It picks the challenge c and sends it (serialized) to the signer; the
- *     public commitment matrices (A1/A2prime/Bmat) and the quadratic
- *     equations' R2/r1 structure are pure functions of the public
- *     parameters, so it derives those independently rather than trusting a
- *     copy from the signer. The one exception is r0 (the equations'
- *     constant term): in this construction it is not reducible to a simple
- *     closed form of c alone (see the comment on compute_r0), so -- as in
- *     the original single-process version of this test, which simply
- *     shared one r0 array between its prove and verify calls -- it is
- *     computed by whoever holds the witness (the signer) and travels as
- *     part of the serialized proof. This is a known limitation of the
- *     construction, not something this refactor resolves; see
- *     falcon-devicebind-design.md's "Risks" section.
+ *     It picks the challenge c and sends it (serialized) to the signer.  ALL
+ *     public data is a pure function of the public parameters and c, so the
+ *     verifier derives it independently instead of trusting the signer: the
+ *     commitment matrices (A1/A2prime/Bmat), the quadratic equations' R2/r1
+ *     structure, AND the constant term r0 = -c (fdb_compute_r0_public, derived
+ *     from the verifier's own challenge -- see fdb_verifier_verify).  r0 is
+ *     therefore NOT serialized; this is what binds the proof to c.  (An
+ *     earlier version made r0 witness-derived and sent it on the wire, which
+ *     was unsound -- the equation became a tautology independent of c.  See
+ *     falcon-devicebind-soundness-issue.md.)
  *
- * Deg-512 objects are the 8-block isoring representation; multiply-by-h is
- * the matrix M_h (validated in devicebind-isoring-test), so the quadratic
- * term (s2*h)_iso[i] = sum_{j,k} M_e[k][i][j] * h_iso[k] * s2_iso[j], with
- * M_e[k]=lin_toisoring(e_k).  k is the mod-p quotient (route b).
+ * Deg-512 objects are the 8-block isoring representation.  RF = RP[X]/(X^8-Y)
+ * with Y = X^8, so for s2 = sum_l s2iso[l] X^l and h = sum_k hiso[k] X^k the
+ * quadratic term is the negacyclic convolution
+ *   (s2*h)_iso[m] = sum_{l+k=m} hiso[k]*s2iso[l] + sum_{l+k=m+8} Y*hiso[k]*s2iso[l]
+ * (coeff 1, resp. Y, in R2; validated against M_h*s2iso).  k is the mod-p
+ * quotient (route b).
  */
 
 #define NEQ 8       /* 8 quadratic block equations */
@@ -138,53 +137,6 @@ mul_matrix (polymat_t M, poly_t x)
   polymat_free (xmat);
 }
 
-/* the 8 fixed structure-constant matrices Me[k] = lin_toisoring(e_k),
- * independent of the secret key h -- both the signer and the verifier need
- * these (the signer to build r0, both to build R2/r1), so this is shared. */
-static void
-build_structure_constants (polymat_t Me[8])
-{
-  poly_t ef;
-  polyvec_t ev;
-  unsigned int i, j, kk;
-  int64_t gmax = 0;
-
-  poly_alloc (ef, RF);
-  polyvec_alloc (ev, RF, 8);
-  for (kk = 0; kk < 8; kk++)
-    {
-      polyvec_set_zero (ev);
-      poly_set_one (polyvec_get_elem (ev, kk));
-      poly_fromisoring (ef, ev);
-      polymat_alloc (Me[kk], RP, 8, 8);
-      mul_matrix (Me[kk], ef);
-      polymat_fromcrt (Me[kk]);
-      polymat_redc (Me[kk], Me[kk]); /* structure constants gamma in {0,+-1} */
-    }
-  /* sanity: report the largest |gamma| (expected 1 for the block-negacyclic
-   * iso) */
-  {
-    int64_t gc[ANON_DEG];
-    unsigned int blk;
-    for (kk = 0; kk < 8; kk++)
-      for (i = 0; i < 8; i++)
-        for (j = 0; j < 8; j++)
-          {
-            poly_get_coeffvec_i64 (gc, polymat_get_elem (Me[kk], i, j));
-            for (blk = 0; blk < RP->d; blk++)
-              {
-                int64_t a = gc[blk] < 0 ? -gc[blk] : gc[blk];
-                if (a > gmax)
-                  gmax = a;
-              }
-          }
-    fprintf (stderr, "  max|gamma| = %lld (expect 1)\n", (long long)gmax);
-  }
-
-  polyvec_free (ev);
-  poly_free (ef);
-}
-
 /* wire format for the Falcon challenge c: 512 coefficients, big-endian
  * uint16 each (values are always in [0, ANON_P)). */
 static void
@@ -239,10 +191,10 @@ typedef struct
   poly_t cpoly;
   spolymat_t R2ii[NEQ];
   spolyvec_t r1ii[NEQ];
-  poly_t r0ii[NEQ];
   spolymat_ptr R2[NEQ];
   spolyvec_ptr r1[NEQ];
-  poly_ptr r0[NEQ];
+  /* no r0: the signer never needs the equations' constant term (lnp_tbox_prove
+   * works from the witness, and r0 = -c is not serialized -- see fdb_encproof) */
   polymat_t Es0, Em0, Ds, Dm, A1, A2prime, Bmat;
   polyvec_t v0, u;
   polymat_ptr Es[1], Em[1];
@@ -289,11 +241,11 @@ typedef struct
   double t_verify;
 } fdb_verifier_ctx_t[1];
 
-/* ---- public equation structure: R2/r1 from the fixed Me[8] structure
- * constants, independent of the secret key h.  Identical computation on
- * both the signer and verifier side -- no secret data involved, so each
- * side derives it independently rather than one side handing the other a
- * live pointer. ------------------------------------------------------------ */
+/* ---- public equation structure: R2/r1 for the 8 block equations, from the
+ * negacyclic-convolution structure constants (see below), independent of the
+ * secret key h.  Identical computation on both the signer and verifier side --
+ * no secret data involved, so each side derives it independently rather than
+ * one side handing the other a live pointer. --------------------------------- */
 static void
 build_equation_structure (spolymat_ptr R2[NEQ], spolyvec_ptr r1[NEQ],
                           spolymat_t R2ii[NEQ], spolyvec_t r1ii[NEQ],
@@ -301,31 +253,45 @@ build_equation_structure (spolymat_ptr R2[NEQ], spolyvec_ptr r1[NEQ],
                           unsigned int Z, unsigned int l, unsigned int n,
                           unsigned int n_)
 {
-  polymat_t Me[8];
   spolymat_t R2_;
   spolyvec_t r1_;
   unsigned int i, j, kk;
   poly_ptr pe;
 
-  build_structure_constants (Me);
-
   spolymat_alloc (R2_, Rq, n_, n_, (n_ * n_ - n_) / 2 + n_);
   spolyvec_alloc (r1_, Rq, n_, n_);
 
-  /* eq i:  s1iso[i] + sum_{j,k} Me[k][i][j]*s2iso[j]*hiso[k] - c_i = 0
-   * local indices: s1iso[i]=2i, s2iso[j]=16+2j, hiso[k]=32+2k */
+  /* eq i:  s1iso[i] + (s2*h)_iso[i] - c_i - p*k[i] = 0   (constant -c_i = r0[i]
+   * is public, added by the verifier -- not built here).
+   * local (n_) witness indices: s1iso[i]=2i, s2iso[j]=16+2j, hiso[k]=32+2k,
+   * k[i]=48+2i. */
   for (i = 0; i < NEQ; i++)
     {
       spolymat_alloc (R2ii[i], Rq, n, n, (n * n - n) / 2 + n);
       spolyvec_alloc (r1ii[i], Rq, n, n);
 
+      /* Quadratic term (s2*h)_iso[i].  RF = RP[X]/(X^8 - Y), Y = X^8, so with
+       * s2 = sum_l s2iso[l] X^l, h = sum_k hiso[k] X^k:
+       *   (s2*h)_iso[i] = sum_{l+k=i}   hiso[k]*s2iso[l]
+       *                 + sum_{l+k=i+8} Y*hiso[k]*s2iso[l]
+       * (verified against M_h*s2iso).  Couple s2iso[l]=slot 16+2l with
+       * hiso[k]=slot 32+2k; coeff 1 when l+k=i, coeff Y (deg-1 monomial) on
+       * the negacyclic wrap l+k=i+8.  The old Me[k] structure constants were
+       * wrong -- they do not decompose M_h (see
+       * falcon-devicebind-soundness-issue.md). */
       spolymat_set_empty (R2_);
-      for (j = 0; j < 8; j++)
-        for (kk = 0; kk < 8; kk++)
+      for (kk = 0; kk < 8; kk++)
+        for (j = 0; j < 8; j++)
           {
-            poly_ptr g = polymat_get_elem (Me[kk], i, j); /* = gamma_{i,j,k} */
+            unsigned int sum = j + kk;
+            if (sum != i && sum != i + 8)
+              continue;
             pe = spolymat_insert_elem (R2_, 16 + 2 * j, 32 + 2 * kk);
-            cpq (pe, g);
+            poly_set_zero (pe);
+            if (sum == i)
+              int_set_i64 (poly_get_coeff (pe, 0), 1); /* coeff 1 */
+            else
+              int_set_i64 (poly_get_coeff (pe, 1), 1); /* coeff Y */
           }
       spolymat_sort (R2_);
 
@@ -348,8 +314,6 @@ build_equation_structure (spolymat_ptr R2[NEQ], spolyvec_ptr r1[NEQ],
 
   spolyvec_free (r1_);
   spolymat_free (R2_);
-  for (kk = 0; kk < 8; kk++)
-    polymat_free (Me[kk]);
 }
 
 /* ---- norm-proof selector matrices: purely structural (which witness
@@ -378,7 +342,7 @@ build_norm_selectors (polymat_t Es0, polymat_t Em0, polyvec_t v0,
  * lnp_tbox_encproof; mutates its polyvec args in place, so call it last). */
 static void
 fdb_encproof (uint8_t *out, size_t *len, polyvec_t tA1, polyvec_t tB,
-             polyvec_t hout, poly_t cpoly, poly_ptr r0[NEQ], polyvec_t z1,
+             polyvec_t hout, poly_t cpoly, polyvec_t z1,
              polyvec_t z21, polyvec_t hint, polyvec_t z3, polyvec_t z4,
              const lnp_tbox_params_t params)
 {
@@ -391,11 +355,13 @@ fdb_encproof (uint8_t *out, size_t *len, polyvec_t tA1, polyvec_t tB,
   const unsigned int D = params->quad_eval->quad_many->dcompress->D;
   const int64_t omega = params->quad_eval->quad_many->omega;
   coder_state_t cstate;
-  polyvec_t r0vec;
   size_t prooflen;
-  unsigned int i;
   INT_T (mod, q->nlimbs);
 
+  /* r0 is NOT serialized: it is the public constant -c, which the verifier
+   * derives independently from its own challenge (fdb_compute_r0_public).
+   * Sending it would let a dishonest signer choose the equation's constant
+   * term and break the binding to c (see falcon-devicebind-soundness-issue.md). */
   coder_enc_begin (cstate, out);
   polyvec_fromcrt (tB);
   polyvec_mod (tB, tB);
@@ -411,19 +377,6 @@ fdb_encproof (uint8_t *out, size_t *len, polyvec_t tA1, polyvec_t tB,
   polyvec_mod (tA1, tA1);
   polyvec_redp (tA1, tA1);
   coder_enc_urandom3 (cstate, tA1, mod, log2q - D);
-
-  /* r0: the quadratic equations' constant term -- see the top-of-file
-   * comment on why this comes from the signer rather than being derived by
-   * the verifier. Encoded the same way as the other full-size (mod q)
-   * fields above. */
-  polyvec_alloc (r0vec, Rq, NEQ);
-  for (i = 0; i < NEQ; i++)
-    poly_set (polyvec_get_elem (r0vec, i), r0[i]);
-  polyvec_fromcrt (r0vec);
-  polyvec_mod (r0vec, r0vec);
-  polyvec_redp (r0vec, r0vec);
-  coder_enc_urandom3 (cstate, r0vec, q, log2q);
-  polyvec_free (r0vec);
 
   int_set_i64 (mod, 2 * omega + 1);
   poly_fromcrt (cpoly);
@@ -458,24 +411,22 @@ fdb_encproof (uint8_t *out, size_t *len, polyvec_t tA1, polyvec_t tB,
  * lnp_tbox_decproof). Returns 1 on success, 0 on a malformed buffer. */
 static int
 fdb_decproof (size_t *len, const uint8_t *in, polyvec_t tA1, polyvec_t tB,
-             polyvec_t hout, poly_t cpoly, poly_ptr r0[NEQ], polyvec_t z1,
+             polyvec_t hout, poly_t cpoly, polyvec_t z1,
              polyvec_t z21, polyvec_t hint, polyvec_t z3, polyvec_t z4,
              const lnp_tbox_params_t params)
 {
-  polyring_srcptr Rq = params->tbox->ring;
-  int_srcptr q = Rq->q;
-  const unsigned int log2q = Rq->log2q;
+  int_srcptr q = params->tbox->ring->q;
+  const unsigned int log2q = params->tbox->ring->log2q;
   const unsigned int log2omega = params->quad_eval->quad_many->log2omega;
   const unsigned int D = params->quad_eval->quad_many->dcompress->D;
   const int64_t omega = params->quad_eval->quad_many->omega;
   coder_state_t cstate;
-  polyvec_t r0vec;
   intvec_ptr coeffs;
   size_t prooflen = 0;
   int succ = 0, rc;
-  unsigned int i;
   INT_T (mod, q->nlimbs);
 
+  /* r0 is not on the wire (see fdb_encproof); the verifier derives it. */
   coder_dec_begin (cstate, in);
 
   rc = coder_dec_urandom3 (cstate, tB, q, log2q);
@@ -489,19 +440,6 @@ fdb_decproof (size_t *len, const uint8_t *in, polyvec_t tA1, polyvec_t tB,
   int_set_one (mod);
   int_lshift (mod, mod, log2q - D);
   rc = coder_dec_urandom3 (cstate, tA1, mod, log2q - D);
-  if (rc != 0)
-    goto ret;
-
-  polyvec_alloc (r0vec, Rq, NEQ);
-  rc = coder_dec_urandom3 (cstate, r0vec, q, log2q);
-  if (rc == 0)
-    {
-      polyvec_mod (r0vec, r0vec);
-      polyvec_redc (r0vec, r0vec);
-      for (i = 0; i < NEQ; i++)
-        poly_set (r0[i], polyvec_get_elem (r0vec, i));
-    }
-  polyvec_free (r0vec);
   if (rc != 0)
     goto ret;
 
@@ -647,89 +585,28 @@ compute_quotient (fdb_signer_ctx_t s)
   return ok;
 }
 
-/* r0 for each of the 8 quadratic equations: the residual
- * -(r1^T s + s^T R2 s) evaluated at the actual (committed) witness s =
- * (<s1_real>,<m_real>), auto-morphism-doubled the same way lnp-tbox's
- * quadratic-eval machinery expects.
+/* r0 for each of the 8 quadratic equations is the PUBLIC constant -c_i.
  *
- * This is NOT simply "-c_i": that would be true of a plain evaluation of
- * the Falcon relation, but the automorphism-doubled embedding this
- * construction uses does not collapse to that simple closed form (checked
- * empirically -- a verifier-side "-c_i" candidate produces a value that is
- * orders of magnitude off and fails verification, while this
- * witness-evaluated residual is the one lnp_tbox_verify actually accepts).
- * Consequently r0 cannot currently be re-derived by the verifier from the
- * public challenge alone; it has to come from whoever holds the witness.
- * The signer computes it here and it travels as part of the serialized
- * proof (see fdb_encproof/fdb_decproof). This mirrors exactly what the
- * pre-refactor, single-process version of this test did implicitly by
- * sharing one r0 array between its prove and verify calls -- that
- * implementation detail is now explicit instead of hidden. Understanding
- * *why* the closed form doesn't hold (and whether r0 can be tied back to c
- * some other way) is flagged as unresolved in falcon-devicebind-design.md's
- * "Risks" section and is out of scope for this refactor. */
+ * With the corrected quadratic structure constants (see
+ * build_equation_structure) the equation evaluates, at the honest witness, to
+ *   <r1,s> + <s,R2 s> = s1iso[i] + (s2*h)_iso[i] - p*k[i] = ciso[i]
+ * (the last step by the exact mod-p quotient k), so the block equation
+ * s1 + (s2*h) - c - p*k = 0 closes exactly with r0[i] = -ciso[i].
+ *
+ * r0 is thus a public function of the challenge c alone -- it carries no
+ * witness information and is computed identically by the signer and the
+ * verifier (fdb_compute_r0_public), never transmitted.  This is what binds
+ * the proof to the verifier's challenge; see
+ * falcon-devicebind-soundness-issue.md. */
 static void
-compute_r0 (fdb_signer_ctx_t s)
+fdb_compute_r0_public (poly_ptr r0[NEQ], polyvec_t ciso)
 {
-  polymat_t Me[8];
-  spolymat_t R2_;
-  spolyvec_t r1_;
-  polyvec_t sw, tmp, s1sub, msub, asub, aauto, bsub, bauto;
-  unsigned int i, j, kk;
-  poly_ptr pe;
-
-  build_structure_constants (Me);
-
-  polyvec_alloc (sw, s->Rq, s->n_);
-  polyvec_alloc (tmp, s->Rq, s->n_);
-  polyvec_get_subvec (s1sub, s->s1, 0, s->m1, 1);
-  polyvec_get_subvec (msub, s->mvec, 0, s->l, 1);
-  polyvec_get_subvec (asub, sw, 0, s->m1, 2);
-  polyvec_get_subvec (aauto, sw, 1, s->m1, 2);
-  polyvec_set (asub, s1sub);
-  polyvec_auto (aauto, s1sub);
-  polyvec_get_subvec (bsub, sw, s->m1 * 2, s->l, 2);
-  polyvec_get_subvec (bauto, sw, s->m1 * 2 + 1, s->l, 2);
-  polyvec_set (bsub, msub);
-  polyvec_auto (bauto, msub);
-
-  spolymat_alloc (R2_, s->Rq, s->n_, s->n_, (s->n_ * s->n_ - s->n_) / 2 + s->n_);
-  spolyvec_alloc (r1_, s->Rq, s->n_, s->n_);
-
+  unsigned int i;
   for (i = 0; i < NEQ; i++)
     {
-      spolymat_set_empty (R2_);
-      for (j = 0; j < 8; j++)
-        for (kk = 0; kk < 8; kk++)
-          {
-            poly_ptr g = polymat_get_elem (Me[kk], i, j);
-            pe = spolymat_insert_elem (R2_, 16 + 2 * j, 32 + 2 * kk);
-            cpq (pe, g);
-          }
-      spolymat_sort (R2_);
-
-      spolyvec_set_empty (r1_);
-      pe = spolyvec_insert_elem (r1_, 2 * i);
-      poly_set_one (pe);
-      pe = spolyvec_insert_elem (r1_, 48 + 2 * i);
-      poly_set_zero (pe);
-      int_set_i64 (poly_get_coeff (pe, 0), -(int64_t)ANON_P);
-      spolyvec_sort (r1_);
-
-      polyvec_dot2 (s->r0ii[i], r1_, sw);
-      polyvec_mulsparse (tmp, R2_, sw);
-      polyvec_fromcrt (tmp);
-      poly_adddot (s->r0ii[i], sw, tmp, 0);
-      poly_neg_self (s->r0ii[i]);
-      poly_fromcrt (s->r0ii[i]);
+      cpq (r0[i], polyvec_get_elem (ciso, i)); /* r0[i] = -ciso[i] */
+      poly_neg_self (r0[i]);
     }
-
-  spolyvec_free (r1_);
-  spolymat_free (R2_);
-  polyvec_free (tmp);
-  polyvec_free (sw);
-  for (kk = 0; kk < 8; kk++)
-    polymat_free (Me[kk]);
 }
 
 /* commitment randomness s2 ~ {-1,0,1} */
@@ -769,7 +646,6 @@ fdb_signer_init (fdb_signer_ctx_t s, const lnp_tbox_params_t params,
                  uint8_t seed[32])
 {
   polyring_srcptr Rq;
-  unsigned int i;
 
   s->tbox = params->tbox;
   s->quad = params->quad_eval->quad_many;
@@ -825,12 +701,6 @@ fdb_signer_init (fdb_signer_ctx_t s, const lnp_tbox_params_t params,
   s->Em[0] = s->Em0;
   s->vv[0] = s->v0;
 
-  for (i = 0; i < NEQ; i++)
-    {
-      poly_alloc (s->r0ii[i], Rq);
-      s->r0[i] = s->r0ii[i];
-    }
-
   abdlop_keygen (s->A1, s->A2prime, s->Bmat, seed, s->tbox); /* public setup */
   build_equation_structure (s->R2, s->r1, s->R2ii, s->r1ii, Rq, s->m1, s->Z,
                             s->l, s->n, s->n_);
@@ -868,7 +738,9 @@ fdb_signer_prove (fdb_signer_ctx_t s, uint8_t *proof, size_t *prooflen,
       return 0;
     }
 
-  compute_r0 (s);
+  /* r0 is not needed on the signer side: lnp_tbox_prove does not take the
+   * input equations' constant term (it works from the committed witness), and
+   * r0 is not serialized -- the verifier derives r0 = -c itself. */
   sample_commitment_randomness (s, seed);
   setup_l2_slack (s, params);
 
@@ -884,7 +756,7 @@ fdb_signer_prove (fdb_signer_ctx_t s, uint8_t *proof, size_t *prooflen,
   t1 = wall ();
   s->t_prove = t1 - t0;
 
-  fdb_encproof (proof, prooflen, s->tA1, s->tB, s->hout, s->cpoly, s->r0,
+  fdb_encproof (proof, prooflen, s->tA1, s->tB, s->hout, s->cpoly,
                s->z1, s->z21, s->hint, s->z3, s->z4, params);
   return 1;
 }
@@ -966,22 +838,44 @@ fdb_verifier_new_challenge (uint8_t challenge[FDB_CHALLENGE_BYTES])
   challenge_encode (challenge, cc16);
 }
 
-/* deserialize the received commitment + proof (including r0 -- see the
- * top-of-file comment) and check it against this verifier's own
- * independently derived public state. */
+/* deserialize the received commitment + proof and check it against this
+ * verifier's own independently derived public state.  r0 = -c is derived here
+ * from the verifier's OWN challenge (never taken from the signer) -- this is
+ * what binds the proof to the chosen challenge. */
 static int
 fdb_verifier_verify (fdb_verifier_ctx_t v, const uint8_t *proof,
-                     size_t prooflen, const lnp_tbox_params_t params)
+                     size_t prooflen,
+                     const uint8_t challenge[FDB_CHALLENGE_BYTES],
+                     const lnp_tbox_params_t params)
 {
   double t1, t2;
   size_t declen;
   int b;
+  int16_t cc16[512];
+  int64_t cf64[512];
+  poly_t cf;
+  polyvec_t ciso;
+  unsigned int i;
 
   t1 = wall ();
-  b = fdb_decproof (&declen, proof, v->tA1, v->tB, v->hout, v->cpoly, v->r0,
+  b = fdb_decproof (&declen, proof, v->tA1, v->tB, v->hout, v->cpoly,
                     v->z1, v->z21, v->hint, v->z3, v->z4, params);
   if (!b || declen != prooflen)
     return 0;
+
+  /* r0 = -c, from the verifier's own challenge */
+  poly_alloc (cf, RF);
+  polyvec_alloc (ciso, RP, 8);
+  challenge_decode (cc16, challenge);
+  for (i = 0; i < 512; i++)
+    cf64[i] = cc16[i];
+  poly_set_coeffvec_i64 (cf, cf64);
+  poly_toisoring (ciso, cf);
+  polyvec_fromcrt (ciso);
+  polyvec_redc (ciso, ciso);
+  fdb_compute_r0_public (v->r0, ciso);
+  polyvec_free (ciso);
+  poly_free (cf);
 
   /* fdb_decproof leaves values in their encoded (redp) representation;
    * lnp_tbox_verify expects the centered one (mirrors lin-proofs.c's
@@ -1039,12 +933,36 @@ run (uint8_t seed[32], const lnp_tbox_params_t params)
   /* verifier -> wire: challenge */
   fdb_verifier_new_challenge (challenge);
 
-  /* signer -> wire: commitment + proof (including r0) */
+  /* signer -> wire: commitment + proof (r0 is NOT sent) */
   if (!fdb_signer_prove (signer, proof, &prooflen, challenge, params, seed))
     return -1;
 
-  bres = fdb_verifier_verify (verifier, proof, prooflen, params);
+  /* honest: verify against the challenge the proof was made for -> accept */
+  bres = fdb_verifier_verify (verifier, proof, prooflen, challenge, params);
   bres = report_honest_result (signer, verifier, prooflen, bres);
+
+  /* soundness / binding: verify the SAME proof against a DIFFERENT challenge
+   * -> must reject.  The verifier derives r0 = -c' from its own challenge, so
+   * the committed witness no longer satisfies s1 + (s2*h) - c' - p*k = 0 and
+   * verification must fail.  This exercises the reject path that the earlier
+   * (tautological-r0) construction could not; see
+   * falcon-devicebind-soundness-issue.md. */
+  {
+    uint8_t challenge2[FDB_CHALLENGE_BYTES];
+    int bad;
+    fdb_verifier_new_challenge (challenge2);
+    bad = fdb_verifier_verify (verifier, proof, prooflen, challenge2, params);
+    if (bad != 0)
+      {
+        fprintf (stderr,
+                 "  [FAIL] proof accepted under a DIFFERENT challenge -- not "
+                 "bound to c!\n");
+        bres = 0;
+      }
+    else
+      fprintf (stderr,
+               "  [OK] proof rejected under a different challenge\n");
+  }
   return bres;
 }
 
