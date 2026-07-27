@@ -17,9 +17,12 @@ wall (void)
  *
  * Two independent roles, talking only over serialized byte buffers:
  *
- *   - the SIGNER holds a Falcon-512 keypair (sk, pk) in plain and, given a
- *     challenge c, returns a short (s1,s2) with s1 + s2*h = c (mod
- *     p=12289), ||(s1,s2)|| <= beta.  It then proves in ZERO KNOWLEDGE:
+ *   - the SIGNER holds a Falcon-512 keypair (sk, pk) in a secure element and
+ *     exposes only BLACKBOX signing: given a message, the SE samples a fresh
+ *     40-byte salt, derives c = HashToPoint(salt||msg) as in plain Falcon, and
+ *     returns a short (s1,s2) with s1 + s2*h = c (mod p=12289),
+ *     ||(s1,s2)|| <= beta, together with the salt.  It then proves in ZERO
+ *     KNOWLEDGE:
  *
  *         s1 + s2*h - c - p*k = 0     (8 block equations over Rp),
  *         ||(s1,s2)||_2 <= beta,      ||k||_inf <= B'
@@ -28,16 +31,18 @@ wall (void)
  *     the resulting proof (with its ABDLOP commitment) to the verifier.
  *
  *   - the VERIFIER never sees h, the signature, or any other witness value.
- *     It picks the challenge c and sends it (serialized) to the signer.  ALL
- *     public data is a pure function of the public parameters and c, so the
- *     verifier derives it independently instead of trusting the signer: the
- *     commitment matrices (A1/A2prime/Bmat), the quadratic equations' R2/r1
- *     structure, AND the constant term r0 = -c (fdb_compute_r0_public, derived
- *     from the verifier's own challenge -- see fdb_verifier_verify).  r0 is
- *     therefore NOT serialized; this is what binds the proof to c.  (An
- *     earlier version made r0 witness-derived and sent it on the wire, which
- *     was unsound -- the equation became a tautology independent of c.  See
- *     falcon-devicebind-soundness-issue.md.)
+ *     It picks a MESSAGE and sends it to the signer; the signer returns the
+ *     salt (with the proof).  The verifier recomputes c = HashToPoint(salt||msg)
+ *     itself -- it never gets c directly and cannot choose it, matching a
+ *     blackbox SE.  ALL public data is then a pure function of the public
+ *     parameters and c, so the verifier derives it independently instead of
+ *     trusting the signer: the commitment matrices (A1/A2prime/Bmat), the
+ *     quadratic equations' R2/r1 structure, AND the constant term r0 = -c
+ *     (fdb_compute_r0_public, derived from the verifier's own c -- see
+ *     fdb_verifier_verify).  r0 is therefore NOT serialized; this is what binds
+ *     the proof to the message.  (An earlier version made r0 witness-derived
+ *     and sent it on the wire, which was unsound -- the equation became a
+ *     tautology independent of c.  See falcon-devicebind-soundness-issue.md.)
  *
  * Deg-512 objects are the 8-block isoring representation.  RF = RP[X]/(X^8-Y)
  * with Y = X^8, so for s2 = sum_l s2iso[l] X^l and h = sum_k hiso[k] X^k the
@@ -51,7 +56,13 @@ wall (void)
 #define ANON_P 12289
 #define ANON_DEG 64
 
-#define FDB_CHALLENGE_BYTES (512 * 2)
+/* Blackbox-signing model: the key lives in a secure element, so we can only
+ * hand it a MESSAGE, not a challenge c.  The SE samples a fresh 40-byte salt,
+ * derives c = HashToPoint(salt||msg) internally (plain Falcon), signs, and
+ * returns the salt so both sides can recompute c.  The verifier picks the
+ * message; c is a public function of (salt, msg) -- never chosen directly. */
+#define FDB_MSG_BYTES 32
+#define FDB_SALT_BYTES 40
 #define FDB_PROOF_MAXLEN (1 << 20)
 
 static const limb_t anon_q_limbs[] = { ANON_P };
@@ -137,25 +148,14 @@ mul_matrix (polymat_t M, poly_t x)
   polymat_free (xmat);
 }
 
-/* wire format for the Falcon challenge c: 512 coefficients, big-endian
- * uint16 each (values are always in [0, ANON_P)). */
+/* c = HashToPoint(salt || msg), as in plain Falcon.  Both the signer and the
+ * verifier derive c this way from the public (salt, msg) -- c is never sent on
+ * the wire, only the salt is (alongside the proof). */
 static void
-challenge_encode (uint8_t out[FDB_CHALLENGE_BYTES], const int16_t cc16[512])
+derive_challenge (int16_t cc16[512], const uint8_t salt[FDB_SALT_BYTES],
+                  const uint8_t *msg, size_t msglen)
 {
-  unsigned int i;
-  for (i = 0; i < 512; i++)
-    {
-      out[2 * i] = (uint8_t)(((uint16_t)cc16[i]) >> 8);
-      out[2 * i + 1] = (uint8_t)(((uint16_t)cc16[i]) & 0xff);
-    }
-}
-
-static void
-challenge_decode (int16_t cc16[512], const uint8_t in[FDB_CHALLENGE_BYTES])
-{
-  unsigned int i;
-  for (i = 0; i < 512; i++)
-    cc16[i] = (int16_t)(((uint16_t)in[2 * i] << 8) | in[2 * i + 1]);
+  falcon_hash_to_point (cc16, salt, FDB_SALT_BYTES, msg, msglen);
 }
 
 /*
@@ -707,13 +707,15 @@ fdb_signer_init (fdb_signer_ctx_t s, const lnp_tbox_params_t params,
   build_norm_selectors (s->Es0, s->Em0, s->v0, s->Ds, s->Dm, s->u);
 }
 
-/* decode the wire challenge, sign it, build the witness and the proof, and
- * serialize the commitment + proof to `proof`/`*prooflen`.  Returns 0 if the
- * relation/iso sanity check fails (should not happen for a genuine Falcon
- * signature), 1 on success. */
+/* BLACKBOX-sign the given message (SE samples the salt, derives c, returns
+ * the salt in `salt`), then derive c = HashToPoint(salt||msg), build the
+ * witness and the proof, and serialize the commitment + proof to
+ * `proof`/`*prooflen`.  Returns 0 if the relation/iso sanity check fails
+ * (should not happen for a genuine Falcon signature), 1 on success. */
 static int
 fdb_signer_prove (fdb_signer_ctx_t s, uint8_t *proof, size_t *prooflen,
-                  const uint8_t challenge[FDB_CHALLENGE_BYTES],
+                  const uint8_t *msg, size_t msglen,
+                  uint8_t salt[FDB_SALT_BYTES],
                   const lnp_tbox_params_t params, uint8_t seed[32])
 {
   int16_t cc16[512];
@@ -721,12 +723,15 @@ fdb_signer_prove (fdb_signer_ctx_t s, uint8_t *proof, size_t *prooflen,
   unsigned int i;
   double t0, t1;
 
-  challenge_decode (cc16, challenge);
+  /* blackbox SE: message in -> (salt, s1, s2) out; the key never leaves. */
+  falcon_sign_message (salt, s->s1c16, s->s2c16, msg, msglen, s->sk);
+
+  /* recompute the challenge c the SE hashed to (public: salt + msg) */
+  derive_challenge (cc16, salt, msg, msglen);
   for (i = 0; i < 512; i++)
     cf64[i] = cc16[i];
   poly_set_coeffvec_i64 (s->cf, cf64);
 
-  falcon_preimage_sample (s->s1c16, s->s2c16, cc16, s->sk);
   poly_set_coeffvec_i16 (s->s1f, s->s1c16);
   poly_set_coeffvec_i16 (s->s2f, s->s2c16);
 
@@ -821,31 +826,24 @@ fdb_verifier_init (fdb_verifier_ctx_t v, const lnp_tbox_params_t params,
   build_norm_selectors (v->Es0, v->Em0, v->v0, v->Ds, v->Dm, v->u);
 }
 
-/* pick a fresh challenge and serialize it for the wire. */
+/* pick a fresh random message for the wire.  The verifier chooses only the
+ * message; the challenge c is derived (by both sides) from HashToPoint of the
+ * salt the SE returns -- it is never chosen directly. */
 static void
-fdb_verifier_new_challenge (uint8_t challenge[FDB_CHALLENGE_BYTES])
+fdb_verifier_new_message (uint8_t msg[FDB_MSG_BYTES])
 {
-  int16_t cc16[512];
-  unsigned int i;
-
-  /* uniform in [0,p) (stand-in for HashToPoint) */
-  for (i = 0; i < 512; i++)
-    {
-      uint8_t b2[2];
-      bytes_urandom (b2, 2);
-      cc16[i] = (int16_t)((((unsigned)b2[0] << 8) | b2[1]) % ANON_P);
-    }
-  challenge_encode (challenge, cc16);
+  bytes_urandom (msg, FDB_MSG_BYTES);
 }
 
 /* deserialize the received commitment + proof and check it against this
  * verifier's own independently derived public state.  r0 = -c is derived here
- * from the verifier's OWN challenge (never taken from the signer) -- this is
- * what binds the proof to the chosen challenge. */
+ * from c = HashToPoint(salt||msg) -- the verifier recomputes c itself from the
+ * message it chose and the salt returned by the SE (never taken from the
+ * signer's proof) -- this is what binds the proof to the message. */
 static int
 fdb_verifier_verify (fdb_verifier_ctx_t v, const uint8_t *proof,
-                     size_t prooflen,
-                     const uint8_t challenge[FDB_CHALLENGE_BYTES],
+                     size_t prooflen, const uint8_t *msg, size_t msglen,
+                     const uint8_t salt[FDB_SALT_BYTES],
                      const lnp_tbox_params_t params)
 {
   double t1, t2;
@@ -863,10 +861,10 @@ fdb_verifier_verify (fdb_verifier_ctx_t v, const uint8_t *proof,
   if (!b || declen != prooflen)
     return 0;
 
-  /* r0 = -c, from the verifier's own challenge */
+  /* r0 = -c, from c = HashToPoint(salt||msg) recomputed by the verifier */
   poly_alloc (cf, RF);
   polyvec_alloc (ciso, RP, 8);
-  challenge_decode (cc16, challenge);
+  derive_challenge (cc16, salt, msg, msglen);
   for (i = 0; i < 512; i++)
     cf64[i] = cc16[i];
   poly_set_coeffvec_i64 (cf, cf64);
@@ -922,7 +920,8 @@ run (uint8_t seed[32], const lnp_tbox_params_t params)
 {
   fdb_signer_ctx_t signer;
   fdb_verifier_ctx_t verifier;
-  uint8_t challenge[FDB_CHALLENGE_BYTES];
+  uint8_t msg[FDB_MSG_BYTES];
+  uint8_t salt[FDB_SALT_BYTES];
   static uint8_t proof[FDB_PROOF_MAXLEN];
   size_t prooflen;
   int bres;
@@ -930,38 +929,41 @@ run (uint8_t seed[32], const lnp_tbox_params_t params)
   fdb_signer_init (signer, params, seed);
   fdb_verifier_init (verifier, params, seed);
 
-  /* verifier -> wire: challenge */
-  fdb_verifier_new_challenge (challenge);
+  /* verifier -> wire: message */
+  fdb_verifier_new_message (msg);
 
-  /* signer -> wire: commitment + proof (r0 is NOT sent) */
-  if (!fdb_signer_prove (signer, proof, &prooflen, challenge, params, seed))
+  /* signer -> wire: commitment + proof + salt (r0 and c are NOT sent) */
+  if (!fdb_signer_prove (signer, proof, &prooflen, msg, FDB_MSG_BYTES, salt,
+                         params, seed))
     return -1;
 
-  /* honest: verify against the challenge the proof was made for -> accept */
-  bres = fdb_verifier_verify (verifier, proof, prooflen, challenge, params);
+  /* honest: verify against the message the proof was made for -> accept */
+  bres = fdb_verifier_verify (verifier, proof, prooflen, msg, FDB_MSG_BYTES,
+                              salt, params);
   bres = report_honest_result (signer, verifier, prooflen, bres);
 
-  /* soundness / binding: verify the SAME proof against a DIFFERENT challenge
-   * -> must reject.  The verifier derives r0 = -c' from its own challenge, so
-   * the committed witness no longer satisfies s1 + (s2*h) - c' - p*k = 0 and
-   * verification must fail.  This exercises the reject path that the earlier
-   * (tautological-r0) construction could not; see
+  /* soundness / binding: verify the SAME proof (and salt) against a DIFFERENT
+   * message -> must reject.  The verifier derives c' = HashToPoint(salt||msg')
+   * and r0 = -c', so the committed witness no longer satisfies
+   * s1 + (s2*h) - c' - p*k = 0 and verification must fail.  This exercises the
+   * reject path that the earlier (tautological-r0) construction could not; see
    * falcon-devicebind-soundness-issue.md. */
   {
-    uint8_t challenge2[FDB_CHALLENGE_BYTES];
+    uint8_t msg2[FDB_MSG_BYTES];
     int bad;
-    fdb_verifier_new_challenge (challenge2);
-    bad = fdb_verifier_verify (verifier, proof, prooflen, challenge2, params);
+    fdb_verifier_new_message (msg2);
+    bad = fdb_verifier_verify (verifier, proof, prooflen, msg2, FDB_MSG_BYTES,
+                               salt, params);
     if (bad != 0)
       {
         fprintf (stderr,
-                 "  [FAIL] proof accepted under a DIFFERENT challenge -- not "
-                 "bound to c!\n");
+                 "  [FAIL] proof accepted under a DIFFERENT message -- not "
+                 "bound to the message!\n");
         bres = 0;
       }
     else
       fprintf (stderr,
-               "  [OK] proof rejected under a different challenge\n");
+               "  [OK] proof rejected under a different message\n");
   }
   return bres;
 }

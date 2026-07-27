@@ -1656,6 +1656,11 @@ void falcon_keygen (uint8_t sk[1281], uint8_t pk[897]);
 void falcon_decode_pubkey (int16_t h[512], const uint8_t pk[897]);
 void falcon_preimage_sample (int16_t s1[512], int16_t s2[512],
                              const int16_t t[512], const uint8_t sk[1281]);
+void falcon_hash_to_point (int16_t c[512], const uint8_t *salt, size_t saltlen,
+                           const uint8_t *msg, size_t msglen);
+void falcon_sign_message (uint8_t salt[40], int16_t s1[512], int16_t s2[512],
+                          const uint8_t *msg, size_t msglen,
+                          const uint8_t sk[1281]);
 
 /********************************************************************
  * 3.2 Internal functions and macros

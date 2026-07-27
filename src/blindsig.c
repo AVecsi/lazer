@@ -129,6 +129,45 @@ err:
   exit (EXIT_FAILURE);
 }
 
+/* Falcon HashToPoint: c = HashToPoint(salt || msg), 512 coeffs in [0,q).
+ * SHAKE256(salt||msg) then per-spec rejection sampling (hash_to_point_vartime),
+ * exactly as plain Falcon derives the challenge point from nonce+message. */
+void
+falcon_hash_to_point (int16_t c[DEG_], const uint8_t *salt, size_t saltlen,
+                      const uint8_t *msg, size_t msglen)
+{
+  shake256_context sc;
+  uint16_t hm[DEG_];
+  unsigned int i;
+
+  shake256_init (&sc);
+  shake256_inject (&sc, salt, saltlen);
+  shake256_inject (&sc, msg, msglen);
+  shake256_flip (&sc);
+  Zf (hash_to_point_vartime) ((inner_shake256_context *)&sc, hm, SIGNER_LOGN);
+  for (i = 0; i < DEG_; i++)
+    c[i] = (int16_t)hm[i];
+}
+
+/* Blackbox (secure-element) signing: the caller supplies only a message; the
+ * key never leaves the SE and the challenge c is NOT caller-chosen.  A fresh
+ * 40-byte salt/nonce is sampled internally, c = HashToPoint(salt||msg) is
+ * derived as in plain Falcon, and a short preimage (s1,s2) with s1+s2*h=c is
+ * returned together with the salt (so the challenge can be recomputed). */
+void
+falcon_sign_message (uint8_t salt[40], int16_t s1[DEG_], int16_t s2[DEG_],
+                     const uint8_t *msg, size_t msglen,
+                     const uint8_t sk[SKBYTES])
+{
+  shake256_context rng;
+  int16_t c[DEG_];
+
+  shake256_init_prng_from_system (&rng);
+  shake256_extract (&rng, salt, 40);
+  falcon_hash_to_point (c, salt, 40, msg, msglen);
+  falcon_preimage_sample (s1, s2, c, sk);
+}
+
 void
 signer_clear (signer_state_t state)
 {
