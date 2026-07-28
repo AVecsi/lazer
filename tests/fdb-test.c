@@ -1,5 +1,5 @@
-#include "lazer.h"
 #include "fdb-params.h"
+#include "lazer.h"
 #include "test.h"
 #include <mpfr.h>
 #include <time.h>
@@ -22,9 +22,11 @@ wall (void)
  *
  *         t_h = AR*rc + AM*h        (over Rq; AR 8x16, AM 8x8 public)
  *
- *     The verifier stores t_h.  rc stays secret with the holder; it becomes
- *     part of every later proof's witness.  (t_h is hiding -- MLWE with the
- *     short rc -- so publishing it reveals nothing about h.)
+ *     The verifier receives t_h in serialized form (like everything else
+ *     that crosses the boundary) and stores it.  rc stays secret with the
+ *     holder; it becomes part of every later proof's witness.  (t_h is
+ *     hiding -- MLWE with the short rc -- so publishing it reveals nothing
+ *     about h.)
  *
  *   - the SIGNER holds a Falcon-512 keypair (sk, pk) in a secure element and
  *     exposes only BLACKBOX signing: given a message, the SE samples a fresh
@@ -37,8 +39,8 @@ wall (void)
  *         AR*rc + AM*h - t_h  = 0     (8 linear block equations over Rq:
  *                                      the credential opens to THIS h),
  *         ||(s1,s2)||_2 <= beta,      ||rc||_2 <= sqrt(16*64),
- *         ||k||_inf <= B',            ||h||_inf <= (p-1)/2  (scaled rows of
- *                                      the same approximate-linf proof)
+ *         ||(k, FSCALE*h)||_inf <= B' (one approximate-linf proof; its
+ *                                      scaled rows bound |h|_inf)
  *
  *     revealing neither h, the signature, nor rc (only c and t_h are
  *     public), and sends the resulting proof (with its ABDLOP commitment)
@@ -50,8 +52,9 @@ wall (void)
  *     binding mod p -- a cheater with its own key h* could open t_h as
  *     h' = h* + p*mu for an arbitrary mu mod q (p is invertible mod q) and
  *     the Falcon relation, which only sees h' mod p, would still close.
- *     Bounding |h|_inf ~ (p-1)/2 (up to the approximate-proof slack << q/p)
- *     forces h' == h (mod p) up to a short MSIS relation on [AR|AM].
+ *     The proof extracts |h'|_inf <= psi*B'/FSCALE << q, so any second
+ *     opening of t_h is a SHORT solution on [AR|AM]: binding reduces to
+ *     MSIS (see fdb-params.sage for the calibration of FSCALE and B').
  *
  *   - the VERIFIER never sees h, the signature, rc, or any other witness
  *     value.  It picks a MESSAGE and sends it to the signer; the signer
@@ -73,26 +76,47 @@ wall (void)
  * Deg-512 objects are the 8-block isoring representation.  RF = RP[X]/(X^8-Y)
  * with Y = X^8, so for s2 = sum_l s2iso[l] X^l and h = sum_k hiso[k] X^k the
  * quadratic term is the negacyclic convolution
- *   (s2*h)_iso[m] = sum_{l+k=m} hiso[k]*s2iso[l] + sum_{l+k=m+8} Y*hiso[k]*s2iso[l]
- * (coeff 1, resp. Y, in R2; validated against M_h*s2iso).  k is the mod-p
- * quotient (route b).
+ *   (s2*h)_iso[m] = sum_{l+k=m} hiso[k]*s2iso[l] + sum_{l+k=m+8}
+ * Y*hiso[k]*s2iso[l] (coeff 1, resp. Y, in R2; validated against M_h*s2iso).
+ * k is the mod-p quotient (route b).
  *
  * Witness layout (m1 = 32 Ajtai/bounded, l = 16 BDLOP):
  *   s1[0..7]  = s1iso   s1[8..15] = s2iso   s1[16..31] = rc
  *   m[0..7]   = hiso    m[8..15]  = k
  */
 
-#define NEQ 8    /* 8 quadratic block equations (Falcon relation) */
-#define NLIN 8   /* 8 linear block equations (credential opening) */
+#define NEQ 8  /* 8 quadratic block equations (Falcon relation) */
+#define NLIN 8 /* 8 linear block equations (credential opening) */
 #define NEQTOT (NEQ + NLIN)
 #define RC_BLOCKS 16 /* ternary credential commitment randomness rc */
 #define ANON_P 12289
 #define ANON_DEG 64
 
-/* |h|_inf <= (p-1)/2 = 6144 is proven through rows FSCALE*I of the Dm
- * selector: |FSCALE*h|_inf <= Bprime = 8958759 with
- * FSCALE = floor(Bprime/6144) = 1458 (1458*6144 = 8957952 <= Bprime). */
-#define FDB_FSCALE 1458
+/* Witness block offsets -- the single source for the layout
+ *   s1 = (s1iso, s2iso, rc)   m = (hiso, k)
+ * (see the header comment).  EVAR_* map a block's slot to its index among
+ * the quadratic-equation variables, where every slot contributes an
+ * (x, sigma(x)) pair (so indices double) and the BDLOP slots follow the
+ * FDB_M1 real Ajtai slots. */
+#define S1OFF_S1ISO 0
+#define S1OFF_S2ISO 8
+#define S1OFF_RC (S1OFF_S2ISO + 8)
+#define FDB_M1 (S1OFF_RC + RC_BLOCKS) /* real (bounded) Ajtai length = 32 */
+#define MOFF_HISO 0
+#define MOFF_K 8
+#define EVAR_S1(off) (2 * (off))
+#define EVAR_M(off) (2 * (FDB_M1 + (off)))
+
+/* |h|_inf is proven through rows FSCALE*I of the Dm selector: the
+ * approximate-linf proof on (k, FSCALE*h) extracts |FSCALE*h|_inf <=
+ * psi*Bprime, i.e. |h|_inf <= psi*Bprime/FSCALE -- short enough that any
+ * second opening of the credential commitment is a short MSIS solution on
+ * [AR|AM].  FSCALE and Bprime are calibrated in fdb-params.sage (Bprime is
+ * the l2 budget of the whole vector (k, FSCALE*h), sizing stdev4); keep
+ * these two defines in sync with the values there.  FDB_BPRIME is only
+ * used for diagnostics -- the generated params carry its effects. */
+#define FDB_FSCALE 64
+#define FDB_BPRIME 9021921
 
 /* Blackbox-signing model: the key lives in a secure element, so we can only
  * hand it a MESSAGE, not a challenge c.  The SE samples a fresh 40-byte salt,
@@ -102,6 +126,7 @@ wall (void)
 #define FDB_MSG_BYTES 32
 #define FDB_SALT_BYTES 40
 #define FDB_PROOF_MAXLEN (1 << 20)
+#define FDB_CRED_MAXLEN (1 << 13) /* NLIN * 64 coeffs * 51 bits < 8 KiB */
 
 static const limb_t anon_q_limbs[] = { ANON_P };
 static const int_t anon_q = { { (limb_t *)anon_q_limbs, 1, 0 } };
@@ -109,8 +134,8 @@ static const limb_t anon_inv2_limbs[] = { 6145UL };
 static const int_t anon_inv2 = { { (limb_t *)anon_inv2_limbs, 1, 0 } };
 static const limb_t anon_zero_limbs[] = { 0UL };
 static const int_t anon_zero = { { (limb_t *)anon_zero_limbs, 1, 0 } };
-static const polyring_t RP
-    = { { anon_q, ANON_DEG, 14, 6, moduli_d64, 1, anon_zero, NULL, anon_inv2 } };
+static const polyring_t RP = { { anon_q, ANON_DEG, 14, 6, moduli_d64, 1,
+                                 anon_zero, NULL, anon_inv2 } };
 static const polyring_t RF
     = { { anon_q, 512, 14, 0, moduli_d64, 0, anon_zero, NULL, anon_inv2 } };
 
@@ -235,8 +260,8 @@ typedef struct
   spolyvec_ptr r1[NEQTOT];
   /* no r0: the signer never needs the equations' constant term (lnp_tbox_prove
    * works from the witness, and r0 is not serialized -- see fdb_encproof) */
-  polymat_t Es0, Em0, Es1, Em1, Ds, Dm, A1, A2prime, Bmat, ARmat, AMmat;
-  polyvec_t v0, v1, u;
+  /* Em/vv entries and Ds/u are zero and passed to lnp-tbox as NULL */
+  polymat_t Es0, Es1, Dm, A1, A2prime, Bmat, ARmat, AMmat;
   polymat_ptr Es[2], Em[2];
   polyvec_ptr vv[2];
 
@@ -275,8 +300,8 @@ typedef struct
   spolyvec_t r1ii[NEQTOT];
   spolymat_ptr R2[NEQTOT];
   spolyvec_ptr r1[NEQTOT];
-  polymat_t Es0, Em0, Es1, Em1, Ds, Dm, A1, A2prime, Bmat, ARmat, AMmat;
-  polyvec_t v0, v1, u;
+  /* Em/vv entries and Ds/u are zero and passed to lnp-tbox as NULL */
+  polymat_t Es0, Es1, Dm, A1, A2prime, Bmat, ARmat, AMmat;
   polymat_ptr Es[2], Em[2];
   polyvec_ptr vv[2];
 
@@ -289,11 +314,11 @@ typedef struct
  * negacyclic-convolution structure constants resp. the public AR/AM,
  * independent of the secret key h.  Identical computation on both the signer
  * and verifier side -- no secret data involved, so each side derives it
- * independently rather than one side handing the other a live pointer.
+ * independently rather than one side handing the other a live pointer
+ * (both call fdb_public_setup).
  *
- * local (n_) witness slot indices (m1 = 32):
- *   s1iso[i] = 2i,  s2iso[j] = 16+2j,  rc[j] = 32+2j,
- *   hiso[k]  = 64+2k,  k[i] = 80+2i                               ------- */
+ * local (n_) witness slot indices come from the EVAR_S1/EVAR_M layout
+ * macros (e.g. s1iso[i] = EVAR_S1 (S1OFF_S1ISO + i)).            ------- */
 static void
 build_equation_structure (spolymat_ptr R2[NEQTOT], spolyvec_ptr r1[NEQTOT],
                           spolymat_t R2ii[NEQ], spolyvec_t r1ii[NEQTOT],
@@ -333,19 +358,24 @@ build_equation_structure (spolymat_ptr R2[NEQTOT], spolyvec_ptr r1[NEQTOT],
             unsigned int sum = j + kk;
             if (sum != i && sum != i + 8)
               continue;
-            pe = spolymat_insert_elem (R2_, 16 + 2 * j, 64 + 2 * kk);
+            /* R2[s2iso[j], hiso[kk]] = gamma: adds gamma*s2iso[j]*hiso[kk]
+             * to the equation */
+            pe = spolymat_insert_elem (R2_, EVAR_S1 (S1OFF_S2ISO + j),
+                                       EVAR_M (MOFF_HISO + kk));
             poly_set_zero (pe);
             if (sum == i)
-              int_set_i64 (poly_get_coeff (pe, 0), 1); /* coeff 1 */
+              int_set_i64 (poly_get_coeff (pe, 0), 1); /* gamma = 1 */
             else
-              int_set_i64 (poly_get_coeff (pe, 1), 1); /* coeff Y */
+              int_set_i64 (poly_get_coeff (pe, 1), 1); /* gamma = Y (wrap) */
           }
       spolymat_sort (R2_);
 
       spolyvec_set_empty (r1_);
-      pe = spolyvec_insert_elem (r1_, 2 * i); /* + s1iso[i] */
+      /* r1[s1iso[i]] = 1 */
+      pe = spolyvec_insert_elem (r1_, EVAR_S1 (S1OFF_S1ISO + i));
       poly_set_one (pe);
-      pe = spolyvec_insert_elem (r1_, 80 + 2 * i); /* - p*k[i] */
+      /* r1[k[i]] = -p */
+      pe = spolyvec_insert_elem (r1_, EVAR_M (MOFF_K + i));
       poly_set_zero (pe);
       int_set_i64 (poly_get_coeff (pe, 0), -(int64_t)ANON_P);
       spolyvec_sort (r1_);
@@ -370,12 +400,14 @@ build_equation_structure (spolymat_ptr R2[NEQTOT], spolyvec_ptr r1[NEQTOT],
       spolyvec_set_empty (r1_);
       for (j = 0; j < RC_BLOCKS; j++)
         {
-          pe = spolyvec_insert_elem (r1_, 32 + 2 * j); /* AR[i][j]*rc[j] */
+          /* r1[rc[j]] = AR[i][j]: adds AR[i][j]*rc[j] to the equation */
+          pe = spolyvec_insert_elem (r1_, EVAR_S1 (S1OFF_RC + j));
           poly_set (pe, polymat_get_elem (AR, i, j));
         }
       for (kk = 0; kk < 8; kk++)
         {
-          pe = spolyvec_insert_elem (r1_, 64 + 2 * kk); /* AM[i][k]*h[k] */
+          /* r1[hiso[kk]] = AM[i][kk]: adds AM[i][kk]*hiso[kk] */
+          pe = spolyvec_insert_elem (r1_, EVAR_M (MOFF_HISO + kk));
           poly_set (pe, polymat_get_elem (AM, i, kk));
         }
       spolyvec_sort (r1_);
@@ -392,53 +424,83 @@ build_equation_structure (spolymat_ptr R2[NEQTOT], spolyvec_ptr r1[NEQTOT],
 
 /* ---- norm-proof selector matrices: purely structural (which witness
  * slots count toward which norm bound), no secret dependency -- both sides
- * build these identically. ------------------------------------------------ */
+ * build these identically.
+ *
+ * lnp-tbox proves, for the committed witness (s1, m):
+ *   exact l2 bound i:   ||Es_i*s1 + Em_i*m + v_i||_2  <= sqrt(l2Bsqr[i])
+ *   approximate linf:   ||Ds*s1  + Dm*m  + u||_inf    <= Bprime (with slack)
+ * so a selector row picks (a scalar multiple of) one witness block and the
+ * norm is taken over the whole selected vector.  Here:
+ *   Es0*s1 = (s1iso, s2iso)            -> bound beta   (Falcon signature)
+ *   Es1*s1 = rc                        -> bound sqrt(16*64) (ternary rc)
+ *   Dm*m   = (k, FSCALE*h)             -> bound Bprime
+ * (Em0/Em1/Ds/v0/v1/u are zero: no BDLOP slot enters an l2 bound and no
+ * Ajtai slot enters the linf bound.  lnp_tbox_prove/verify take NULL for
+ * zero operands, so those are never allocated.) -------------------------- */
 static void
-build_norm_selectors (polymat_t Es0, polymat_t Em0, polyvec_t v0,
-                      polymat_t Es1, polymat_t Em1, polyvec_t v1,
-                      polymat_t Ds, polymat_t Dm, polyvec_t u)
+build_norm_selectors (polymat_t Es0, polymat_t Es1, polymat_t Dm)
 {
   unsigned int i;
   poly_ptr pe;
 
   /* l2 bound 0: ||(s1iso,s2iso)||_2 <= beta */
   polymat_set_zero (Es0);
-  for (i = 0; i < 16; i++)
-    poly_set_one (polymat_get_elem (Es0, i, i)); /* select s1[0..15] */
-  polymat_set_zero (Em0);
-  polyvec_set_zero (v0);
+  for (i = 0; i < S1OFF_RC; i++)
+    /* Es0[i][i] = 1  =>  (Es0*s1)[i] = s1[i]  (i.e. s1iso,s2iso) */
+    poly_set_one (polymat_get_elem (Es0, i, i));
 
   /* l2 bound 1: ||rc||_2 <= sqrt(16*64) */
   polymat_set_zero (Es1);
   for (i = 0; i < RC_BLOCKS; i++)
-    poly_set_one (polymat_get_elem (Es1, i, 16 + i)); /* select s1[16..31] */
-  polymat_set_zero (Em1);
-  polyvec_set_zero (v1);
+    /* Es1[i][rc[i]] = 1  =>  (Es1*s1)[i] = rc[i] */
+    poly_set_one (polymat_get_elem (Es1, i, S1OFF_RC + i));
 
-  polymat_set_zero (Ds);
   polymat_set_zero (Dm);
   for (i = 0; i < 8; i++)
-    poly_set_one (polymat_get_elem (Dm, i, 8 + i)); /* row i -> m[8+i]=k[i] */
+    /* Dm[i][k[i]] = 1  =>  (Dm*m)[i] = k[i] */
+    poly_set_one (polymat_get_elem (Dm, i, MOFF_K + i));
   for (i = 0; i < 8; i++)
     {
-      /* row 8+i -> FSCALE*m[i] = FSCALE*h[i]: |FSCALE*h|_inf <= Bprime
-       * enforces |h|_inf <= (p-1)/2 (up to the approximate-proof slack),
-       * which is what makes the credential commitment binding mod p (see
-       * the header comment). */
-      pe = polymat_get_elem (Dm, 8 + i, i);
+      /* Dm[8+i][hiso[i]] = FSCALE  =>  (Dm*m)[8+i] = FSCALE*h[i]:
+       * |FSCALE*h|_inf <= psi*Bprime bounds |h|_inf, which is what makes
+       * the credential commitment binding (see the header comment and
+       * fdb-params.sage). */
+      pe = polymat_get_elem (Dm, 8 + i, MOFF_HISO + i);
       poly_set_zero (pe);
       int_set_i64 (poly_get_coeff (pe, 0), FDB_FSCALE);
     }
-  polyvec_set_zero (u);
+}
+
+/* ---- public setup, shared verbatim by both roles: the commitment matrices,
+ * AR/AM, the equations' R2/r1 structure and the norm selectors are all pure
+ * functions of (seed, params).  Factored into one routine so the signer and
+ * the verifier cannot drift apart -- each side calls this instead of
+ * trusting data derived by the other. ------------------------------------ */
+static void
+fdb_public_setup (polymat_t A1, polymat_t A2prime, polymat_t Bmat,
+                  polymat_t ARmat, polymat_t AMmat, spolymat_ptr R2[NEQTOT],
+                  spolyvec_ptr r1[NEQTOT], spolymat_t R2ii[NEQ],
+                  spolyvec_t r1ii[NEQTOT], polymat_t Es0, polymat_t Es1,
+                  polymat_t Dm, abdlop_params_srcptr tbox, polyring_srcptr Rq,
+                  unsigned int m1, unsigned int Z, unsigned int l,
+                  unsigned int n, unsigned int n_, uint8_t seed[32])
+{
+  abdlop_keygen (A1, A2prime, Bmat, seed, tbox);
+  /* domains 100/101 separate AR/AM from abdlop_keygen's seed expansions */
+  polymat_urandom (ARmat, Rq->q, Rq->log2q, seed, 100);
+  polymat_urandom (AMmat, Rq->q, Rq->log2q, seed, 101);
+  build_equation_structure (R2, r1, R2ii, r1ii, ARmat, AMmat, Rq, m1, Z, l, n,
+                            n_);
+  build_norm_selectors (Es0, Es1, Dm);
 }
 
 /* serialize the commitment + proof (mirrors lin-proofs.c's static
  * lnp_tbox_encproof; mutates its polyvec args in place, so call it last). */
 static void
 fdb_encproof (uint8_t *out, size_t *len, polyvec_t tA1, polyvec_t tB,
-             polyvec_t hout, poly_t cpoly, polyvec_t z1,
-             polyvec_t z21, polyvec_t hint, polyvec_t z3, polyvec_t z4,
-             const lnp_tbox_params_t params)
+              polyvec_t hout, poly_t cpoly, polyvec_t z1, polyvec_t z21,
+              polyvec_t hint, polyvec_t z3, polyvec_t z4,
+              const lnp_tbox_params_t params)
 {
   polyring_srcptr Rq = params->tbox->ring;
   int_srcptr q = Rq->q;
@@ -502,13 +564,49 @@ fdb_encproof (uint8_t *out, size_t *len, polyvec_t tA1, polyvec_t tB,
     *len = prooflen;
 }
 
+/* serialize the credential t_h (NLIN Rq polynomials): even the issuance
+ * data crosses the signer/verifier boundary only as bytes, exercising the
+ * same canonical wire encoding a real deployment would use.  Mutates th
+ * into its positive (redp) representation, like fdb_encproof's tB. */
+static void
+fdb_enccred (uint8_t *out, size_t *len, polyvec_t th, polyring_srcptr Rq)
+{
+  coder_state_t cstate;
+
+  coder_enc_begin (cstate, out);
+  polyvec_fromcrt (th);
+  polyvec_mod (th, th);
+  polyvec_redp (th, th);
+  coder_enc_urandom3 (cstate, th, Rq->q, Rq->log2q);
+  coder_enc_end (cstate);
+  *len = coder_get_offset (cstate) >> 3; /* bits -> bytes */
+}
+
+/* deserialize a received credential into th (left in the encoded redp
+ * representation).  Returns 1 on success, 0 on a malformed buffer. */
+static int
+fdb_deccred (size_t *len, const uint8_t *in, polyvec_t th, polyring_srcptr Rq)
+{
+  coder_state_t cstate;
+  int rc;
+
+  coder_dec_begin (cstate, in);
+  rc = coder_dec_urandom3 (cstate, th, Rq->q, Rq->log2q);
+  if (rc != 0)
+    return 0;
+  if (coder_dec_end (cstate) != 1)
+    return 0;
+  *len = coder_get_offset (cstate) >> 3;
+  return 1;
+}
+
 /* deserialize the commitment + proof (mirrors lin-proofs.c's static
  * lnp_tbox_decproof). Returns 1 on success, 0 on a malformed buffer. */
 static int
 fdb_decproof (size_t *len, const uint8_t *in, polyvec_t tA1, polyvec_t tB,
-             polyvec_t hout, poly_t cpoly, polyvec_t z1,
-             polyvec_t z21, polyvec_t hint, polyvec_t z3, polyvec_t z4,
-             const lnp_tbox_params_t params)
+              polyvec_t hout, poly_t cpoly, polyvec_t z1, polyvec_t z21,
+              polyvec_t hint, polyvec_t z3, polyvec_t z4,
+              const lnp_tbox_params_t params)
 {
   int_srcptr q = params->tbox->ring->q;
   const unsigned int log2q = params->tbox->ring->log2q;
@@ -571,9 +669,38 @@ ret:
 static void
 fdb_signer_keygen (fdb_signer_ctx_t s)
 {
-  falcon_keygen (s->sk, s->pk);
-  falcon_decode_pubkey (s->hc16, s->pk);
-  poly_set_coeffvec_i16 (s->hf, s->hc16);
+  falcon_keygen (s->sk, s->pk);           /* (sk, pk): Falcon-512 keypair */
+  falcon_decode_pubkey (s->hc16, s->pk);  /* hc16 = h, coeffs in [0,p) */
+  poly_set_coeffvec_i16 (s->hf, s->hc16); /* hf = h as an RF element */
+}
+
+/* v <- uniform ternary {-1,0,1}^(len*d) from (seed, dom).  Used for the
+ * two long-lived secrets sampled in this file (rc and the commitment
+ * randomness s2) -- one implementation so the sampling convention cannot
+ * silently diverge between them. */
+static void
+sample_ternary (polyvec_t v, polyring_srcptr Rq, const uint8_t seed[32],
+                uint32_t dom)
+{
+  INT_T (lo, Rq->q->nlimbs);
+  INT_T (hi, Rq->q->nlimbs);
+
+  int_set_i64 (lo, -1);
+  int_set_i64 (hi, 1);
+  polyvec_urandom_bnd (v, lo, hi, seed, dom);
+}
+
+/* hiso = iso(h), centered: the 8-block isoring rep of the deg-512 key h
+ * over RP with coefficients in [-(p-1)/2, (p-1)/2].  The ONE recipe used
+ * both at issuance (h as committed in t_h) and at prove time (h as placed
+ * in the witness) -- they must agree or the opening equations do not
+ * close. */
+static void
+compute_hiso (fdb_signer_ctx_t s)
+{
+  poly_toisoring (s->hiso, s->hf);
+  polyvec_fromcrt (s->hiso);
+  polyvec_redc (s->hiso, s->hiso);
 }
 
 /* isoring representations of the secret material (h, c, s1, s2) and M_h,
@@ -583,18 +710,18 @@ fdb_signer_keygen (fdb_signer_ctx_t s)
 static void
 build_isoring_reps (fdb_signer_ctx_t s)
 {
-  poly_toisoring (s->hiso, s->hf);
-  poly_toisoring (s->ciso, s->cf);
-  poly_toisoring (s->s1iso, s->s1f);
-  poly_toisoring (s->s2iso, s->s2f);
-  mul_matrix (s->Mh, s->hf);
+  compute_hiso (s);                  /* hiso  = iso(h)   (8 RP blocks) */
+  poly_toisoring (s->ciso, s->cf);   /* ciso  = iso(c)                 */
+  poly_toisoring (s->s1iso, s->s1f); /* s1iso = iso(s1)                */
+  poly_toisoring (s->s2iso, s->s2f); /* s2iso = iso(s2)                */
+  mul_matrix (s->Mh,
+              s->hf); /* M_h: 8x8 RP matrix with M_h*iso(x) = iso(h*x) */
 
+  /* center everything: coefficients into [-(p-1)/2, (p-1)/2] */
   polyvec_fromcrt (s->s1iso);
   polyvec_redc (s->s1iso, s->s1iso);
   polyvec_fromcrt (s->s2iso);
   polyvec_redc (s->s2iso, s->s2iso);
-  polyvec_fromcrt (s->hiso);
-  polyvec_redc (s->hiso, s->hiso);
   polyvec_fromcrt (s->ciso);
   polyvec_redc (s->ciso, s->ciso);
   polymat_fromcrt (s->Mh);
@@ -614,22 +741,18 @@ fdb_signer_issue (fdb_signer_ctx_t s)
   polyvec_t hq;
   uint8_t rcseed[32];
   unsigned int i;
-  INT_T (lo, s->Rq->q->nlimbs);
-  INT_T (hi, s->Rq->q->nlimbs);
 
-  /* centered isoring rep of h (idempotent; also rebuilt per-proof) */
-  poly_toisoring (s->hiso, s->hf);
-  polyvec_fromcrt (s->hiso);
-  polyvec_redc (s->hiso, s->hiso);
+  /* hiso = iso(h), centered (the same recipe the witness uses) */
+  compute_hiso (s);
 
+  /* hq = hiso lifted into Rq (same integer coefficient values) */
   polyvec_alloc (hq, s->Rq, 8);
   for (i = 0; i < 8; i++)
     cpq (polyvec_get_elem (hq, i), polyvec_get_elem (s->hiso, i));
 
   bytes_urandom (rcseed, sizeof (rcseed)); /* rc is a fresh SECRET */
-  int_set_i64 (lo, -1);
-  int_set_i64 (hi, 1);
-  polyvec_urandom_bnd (s->rc, lo, hi, rcseed, 0);
+  /* rc <- uniform {-1,0,1}^(16*64)  (ternary commitment randomness) */
+  sample_ternary (s->rc, s->Rq, rcseed, 0);
 
   /* t_h = AR*rc + AM*h.  polyvec_mul/addmul NTT-mutate their matrix and
    * vector args in place, so work on copies (rc must stay in its centered
@@ -642,10 +765,13 @@ fdb_signer_issue (fdb_signer_ctx_t s)
     polyvec_t rcc;
     polyvec_alloc (rcc, s->Rq, RC_BLOCKS);
     polyvec_set (rcc, s->rc);
+    /* th = AR * rc          (8x16 matrix-vector product over Rq) */
     polyvec_mul (s->th, ARc, rcc);
+    /* th = th + AM * hq  =  AR*rc + AM*h */
     polyvec_addmul (s->th, AMc, hq, 0);
     polyvec_free (rcc);
   }
+  /* th <- centered coefficient rep mod q */
   polyvec_fromcrt (s->th);
   polyvec_mod (s->th, s->th);
   polyvec_redc (s->th, s->th);
@@ -666,13 +792,19 @@ build_witness (fdb_signer_ctx_t s)
   polyvec_set_zero (s->mvec);
   for (blk = 0; blk < 8; blk++)
     {
+      /* s1[blk]    = s1iso[blk]  (lift RP -> Rq) */
       cpq (polyvec_get_elem (s->s1, blk), polyvec_get_elem (s->s1iso, blk));
-      cpq (polyvec_get_elem (s->s1, 8 + blk), polyvec_get_elem (s->s2iso, blk));
-      cpq (polyvec_get_elem (s->mvec, blk), polyvec_get_elem (s->hiso, blk));
+      /* s1[8+blk]  = s2iso[blk] */
+      cpq (polyvec_get_elem (s->s1, S1OFF_S2ISO + blk),
+           polyvec_get_elem (s->s2iso, blk));
+      /* m[blk]     = hiso[blk] */
+      cpq (polyvec_get_elem (s->mvec, MOFF_HISO + blk),
+           polyvec_get_elem (s->hiso, blk));
     }
+  /* s1[16+blk] = rc[blk]  (already over Rq) */
   for (blk = 0; blk < RC_BLOCKS; blk++)
-    poly_set (polyvec_get_elem (s->s1, 16 + blk),
-              polyvec_get_elem (s->rc, blk)); /* same ring Rq */
+    poly_set (polyvec_get_elem (s->s1, S1OFF_RC + blk),
+              polyvec_get_elem (s->rc, blk));
 }
 
 /* k = (s1iso + M_h*s2iso - ciso)/p computed over Rq: the integer product
@@ -695,6 +827,7 @@ compute_quotient (fdb_signer_ctx_t s)
   polyvec_alloc (s2q, Rq, 8);
   polyvec_alloc (prodq, Rq, 8);
   polyvec_alloc (ciq, Rq, 8);
+  /* lift M_h, s2iso, ciso from RP into Rq (same integer values) */
   for (i = 0; i < 8; i++)
     {
       for (j = 0; j < 8; j++)
@@ -702,17 +835,22 @@ compute_quotient (fdb_signer_ctx_t s)
       cpq (polyvec_get_elem (s2q, i), polyvec_get_elem (s->s2iso, i));
       cpq (polyvec_get_elem (ciq, i), polyvec_get_elem (s->ciso, i));
     }
-  polyvec_mul (prodq, Mhq, s2q); /* = M_h*s2iso over Rq (NTT-mutates Mhq) */
+  /* prodq = M_h * s2iso  = iso(h*s2) as INTEGERS (no mod-p reduction:
+   * |coeffs| ~ 2^31 << q)  (NTT-mutates Mhq) */
+  polyvec_mul (prodq, Mhq, s2q);
   polyvec_fromcrt (prodq);
   for (i = 0; i < 8; i++)
     {
+      /* prodq[i] = prodq[i] + s1iso[i] */
       poly_add (polyvec_get_elem (prodq, i), polyvec_get_elem (prodq, i),
                 polyvec_get_elem (s->s1, i), 0);
+      /* prodq[i] = prodq[i] - ciso[i]   => prodq = s1 + s2*h - c = p*k */
       poly_sub (polyvec_get_elem (prodq, i), polyvec_get_elem (prodq, i),
                 polyvec_get_elem (ciq, i), 0);
     }
   polyvec_redc (prodq, prodq); /* centered; = p*k */
   polyvec_get_coeffvec_i64 (pc, prodq);
+  /* check p | (s1 + s2*h - c) coefficient-wise (Falcon relation mod p) */
   for (i = 0; i < 8 * s->d; i++)
     if (pc[i] % ANON_P != 0)
       ok = 0;
@@ -721,15 +859,17 @@ compute_quotient (fdb_signer_ctx_t s)
       for (j = 0; j < s->d; j++)
         {
           int64_t a;
+          /* k[i]_j = (s1 + s2*h - c)_j / p   (exact integer division) */
           kc[j] = pc[i * s->d + j] / ANON_P;
           a = kc[j] < 0 ? -kc[j] : kc[j];
           if (a > mk)
-            mk = a;
+            mk = a; /* mk = ||k||_inf so far */
         }
-      poly_set_coeffvec_i64 (polyvec_get_elem (s->mvec, 8 + i), kc);
+      /* m[8+i] = k[i]  (quotient goes into the BDLOP part of the witness) */
+      poly_set_coeffvec_i64 (polyvec_get_elem (s->mvec, MOFF_K + i), kc);
     }
   fprintf (stderr, "  |k|_inf = %lld  (Bprime=%d)  exact-div-by-p: %s\n",
-           (long long)mk, 8958759, ok ? "yes" : "NO");
+           (long long)mk, FDB_BPRIME, ok ? "yes" : "NO");
   polymat_free (Mhq);
   polyvec_free (s2q);
   polyvec_free (prodq);
@@ -756,21 +896,10 @@ fdb_compute_r0_public (poly_ptr r0[NEQ], polyvec_t ciso)
   unsigned int i;
   for (i = 0; i < NEQ; i++)
     {
-      cpq (r0[i], polyvec_get_elem (ciso, i)); /* r0[i] = -ciso[i] */
-      poly_neg_self (r0[i]);
+      cpq (r0[i],
+           polyvec_get_elem (ciso, i)); /* r0[i] = ciso[i] (lift to Rq) */
+      poly_neg_self (r0[i]);            /* r0[i] = -ciso[i] */
     }
-}
-
-/* commitment randomness s2 ~ {-1,0,1} */
-static void
-sample_commitment_randomness (fdb_signer_ctx_t s, uint8_t seed[32])
-{
-  INT_T (lo, s->Rq->q->nlimbs);
-  INT_T (hi, s->Rq->q->nlimbs);
-
-  int_set_i64 (lo, -1);
-  int_set_i64 (hi, 1);
-  polyvec_urandom_bnd (s->s2, lo, hi, seed, 200);
 }
 
 /* l2 proof slack values: bound 0 is ||(s1iso,s2iso)||_2 <= beta, bound 1 is
@@ -785,18 +914,23 @@ setup_l2_slack (fdb_signer_ctx_t s, const lnp_tbox_params_t params)
   INT_T (l2b, 2 * s->Rq->q->nlimbs);
   polyvec_t part, upsilon;
 
+  /* upsilon = s1[m1..m1+Z): the Z extension slots holding the slack values */
   polyvec_get_subvec (upsilon, s->s1, s->m1, s->Z, 1);
 
-  polyvec_get_subvec (part, s->s1, 0, 16, 1);
-  int_set (l2b, params->l2Bsqr[0]);
-  polyvec_l2sqr (l2sqr, part);
-  int_sub (l2b, l2b, l2sqr);
+  /* part = (s1iso, s2iso) = s1[0..15] */
+  polyvec_get_subvec (part, s->s1, S1OFF_S1ISO, S1OFF_RC, 1);
+  int_set (l2b, params->l2Bsqr[0]); /* l2b  = beta^2 */
+  polyvec_l2sqr (l2sqr, part);      /* l2sqr = ||(s1iso,s2iso)||_2^2 */
+  int_sub (l2b, l2b, l2sqr);        /* l2b  = beta^2 - ||.||^2  (>= 0) */
+  /* upsilon[0] = binary expansion of the slack (proves ||.||^2 <= beta^2) */
   int_binexp (polyvec_get_elem (upsilon, 0), NULL, l2b);
 
-  polyvec_get_subvec (part, s->s1, 16, RC_BLOCKS, 1);
-  int_set (l2b, params->l2Bsqr[1]);
-  polyvec_l2sqr (l2sqr, part);
-  int_sub (l2b, l2b, l2sqr);
+  /* part = rc = s1[16..31] */
+  polyvec_get_subvec (part, s->s1, S1OFF_RC, RC_BLOCKS, 1);
+  int_set (l2b, params->l2Bsqr[1]); /* l2b  = 16*64 */
+  polyvec_l2sqr (l2sqr, part);      /* l2sqr = ||rc||_2^2 */
+  int_sub (l2b, l2b, l2sqr);        /* l2b  = 16*64 - ||rc||^2  (>= 0) */
+  /* upsilon[1] = binary expansion of the slack (proves ||rc||^2 <= 16*64) */
   int_binexp (polyvec_get_elem (upsilon, 1), NULL, l2b);
 }
 
@@ -851,32 +985,22 @@ fdb_signer_init (fdb_signer_ctx_t s, const lnp_tbox_params_t params,
   polymat_alloc (s->A1, Rq, s->tbox->kmsis, s->tbox->m1);
   polymat_alloc (s->A2prime, Rq, s->tbox->kmsis, s->tbox->m2 - s->tbox->kmsis);
   polymat_alloc (s->Bmat, Rq, s->tbox->l + s->tbox->lext,
-                s->tbox->m2 - s->tbox->kmsis);
+                 s->tbox->m2 - s->tbox->kmsis);
   polymat_alloc (s->ARmat, Rq, NLIN, RC_BLOCKS);
   polymat_alloc (s->AMmat, Rq, NLIN, 8);
   polymat_alloc (s->Es0, Rq, params->n[0], s->m1);
-  polymat_alloc (s->Em0, Rq, params->n[0], s->l);
-  polyvec_alloc (s->v0, Rq, params->n[0]);
   polymat_alloc (s->Es1, Rq, params->n[1], s->m1);
-  polymat_alloc (s->Em1, Rq, params->n[1], s->l);
-  polyvec_alloc (s->v1, Rq, params->n[1]);
-  polymat_alloc (s->Ds, Rq, params->nprime, s->m1);
   polymat_alloc (s->Dm, Rq, params->nprime, s->l);
-  polyvec_alloc (s->u, Rq, params->nprime);
   s->Es[0] = s->Es0;
-  s->Em[0] = s->Em0;
-  s->vv[0] = s->v0;
+  s->Em[0] = NULL; /* zero operands: lnp-tbox takes NULL */
+  s->vv[0] = NULL;
   s->Es[1] = s->Es1;
-  s->Em[1] = s->Em1;
-  s->vv[1] = s->v1;
+  s->Em[1] = NULL;
+  s->vv[1] = NULL;
 
-  abdlop_keygen (s->A1, s->A2prime, s->Bmat, seed, s->tbox); /* public setup */
-  polymat_urandom (s->ARmat, Rq->q, Rq->log2q, seed, 100); /* public setup */
-  polymat_urandom (s->AMmat, Rq->q, Rq->log2q, seed, 101);
-  build_equation_structure (s->R2, s->r1, s->R2ii, s->r1ii, s->ARmat,
-                            s->AMmat, Rq, s->m1, s->Z, s->l, s->n, s->n_);
-  build_norm_selectors (s->Es0, s->Em0, s->v0, s->Es1, s->Em1, s->v1, s->Ds,
-                        s->Dm, s->u);
+  fdb_public_setup (s->A1, s->A2prime, s->Bmat, s->ARmat, s->AMmat, s->R2,
+                    s->r1, s->R2ii, s->r1ii, s->Es0, s->Es1, s->Dm, s->tbox,
+                    Rq, s->m1, s->Z, s->l, s->n, s->n_, seed);
 }
 
 /* BLACKBOX-sign the given message (SE samples the salt, derives c, returns
@@ -887,38 +1011,47 @@ fdb_signer_init (fdb_signer_ctx_t s, const lnp_tbox_params_t params,
 static int
 fdb_signer_prove (fdb_signer_ctx_t s, uint8_t *proof, size_t *prooflen,
                   const uint8_t *msg, size_t msglen,
-                  uint8_t salt[FDB_SALT_BYTES],
-                  const lnp_tbox_params_t params, uint8_t seed[32])
+                  uint8_t salt[FDB_SALT_BYTES], const lnp_tbox_params_t params)
 {
   int16_t cc16[512];
   int64_t cf64[512];
+  uint8_t secseed[32];
   unsigned int i;
   double t0, t1;
 
-  /* blackbox SE: message in -> (salt, s1, s2) out; the key never leaves. */
+  /* blackbox SE: message in -> (salt, s1, s2) out; the key never leaves.
+   * (s1, s2) short with s1 + s2*h = HashToPoint(salt||msg) (mod p). */
   falcon_sign_message (salt, s->s1c16, s->s2c16, msg, msglen, s->sk);
 
   /* recompute the challenge c the SE hashed to (public: salt + msg) */
-  derive_challenge (cc16, salt, msg, msglen);
+  derive_challenge (cc16, salt, msg, msglen); /* c = HashToPoint(salt||msg) */
   for (i = 0; i < 512; i++)
     cf64[i] = cc16[i];
-  poly_set_coeffvec_i64 (s->cf, cf64);
+  poly_set_coeffvec_i64 (s->cf, cf64); /* cf = c as an RF element */
 
-  poly_set_coeffvec_i16 (s->s1f, s->s1c16);
-  poly_set_coeffvec_i16 (s->s2f, s->s2c16);
+  poly_set_coeffvec_i16 (s->s1f, s->s1c16); /* s1f = s1 as an RF element */
+  poly_set_coeffvec_i16 (s->s2f, s->s2c16); /* s2f = s2 as an RF element */
 
   build_isoring_reps (s);
   build_witness (s);
   if (!compute_quotient (s))
     {
-      fprintf (stderr, "  [WARN] s1+s2h-c not 0 mod p (relation/iso mismatch)\n");
+      fprintf (stderr,
+               "  [WARN] s1+s2h-c not 0 mod p (relation/iso mismatch)\n");
       return 0;
     }
 
   /* r0 is not needed on the signer side: lnp_tbox_prove does not take the
    * input equations' constant term (it works from the committed witness), and
    * r0 is not serialized -- the verifier derives -c and -t_h itself. */
-  sample_commitment_randomness (s, seed);
+
+  /* the prover's randomness -- the commitment randomness s2 and (inside
+   * lnp_tbox_prove) the Gaussian masks y1/y3/y4 -- must be FRESH AND SECRET.
+   * It must never derive from the public setup seed the verifier also
+   * holds: with a known seed, z1 = y1 + c*s1 hands the whole witness to
+   * anyone who can recompute y1. */
+  bytes_urandom (secseed, sizeof (secseed));
+  sample_ternary (s->s2, s->Rq, secseed, 200); /* commitment randomness */
   setup_l2_slack (s, params);
 
   memset (s->hashp, 0xff, 32);
@@ -928,13 +1061,13 @@ fdb_signer_prove (fdb_signer_ctx_t s, uint8_t *proof, size_t *prooflen,
   lnp_tbox_prove (s->hashp, s->tB, s->hout, s->cpoly, s->z1, s->z21, s->hint,
                   s->z3, s->z4, s->s1, s->mvec, s->s2, s->tA2, s->A1,
                   s->A2prime, s->Bmat, s->R2, s->r1, NEQTOT, NULL, NULL, NULL,
-                  0, s->Es, s->Em, s->vv, NULL, NULL, NULL, s->Ds, s->Dm,
-                  s->u, seed, params);
+                  0, s->Es, s->Em, s->vv, NULL, NULL, NULL, NULL, s->Dm, NULL,
+                  secseed, params);
   t1 = wall ();
   s->t_prove = t1 - t0;
 
-  fdb_encproof (proof, prooflen, s->tA1, s->tB, s->hout, s->cpoly,
-               s->z1, s->z21, s->hint, s->z3, s->z4, params);
+  fdb_encproof (proof, prooflen, s->tA1, s->tB, s->hout, s->cpoly, s->z1,
+                s->z21, s->hint, s->z3, s->z4, params);
   return 1;
 }
 
@@ -977,24 +1110,18 @@ fdb_verifier_init (fdb_verifier_ctx_t v, const lnp_tbox_params_t params,
   polymat_alloc (v->A1, Rq, v->tbox->kmsis, v->tbox->m1);
   polymat_alloc (v->A2prime, Rq, v->tbox->kmsis, v->tbox->m2 - v->tbox->kmsis);
   polymat_alloc (v->Bmat, Rq, v->tbox->l + v->tbox->lext,
-                v->tbox->m2 - v->tbox->kmsis);
+                 v->tbox->m2 - v->tbox->kmsis);
   polymat_alloc (v->ARmat, Rq, NLIN, RC_BLOCKS);
   polymat_alloc (v->AMmat, Rq, NLIN, 8);
   polymat_alloc (v->Es0, Rq, params->n[0], v->m1);
-  polymat_alloc (v->Em0, Rq, params->n[0], v->l);
-  polyvec_alloc (v->v0, Rq, params->n[0]);
   polymat_alloc (v->Es1, Rq, params->n[1], v->m1);
-  polymat_alloc (v->Em1, Rq, params->n[1], v->l);
-  polyvec_alloc (v->v1, Rq, params->n[1]);
-  polymat_alloc (v->Ds, Rq, params->nprime, v->m1);
   polymat_alloc (v->Dm, Rq, params->nprime, v->l);
-  polyvec_alloc (v->u, Rq, params->nprime);
   v->Es[0] = v->Es0;
-  v->Em[0] = v->Em0;
-  v->vv[0] = v->v0;
+  v->Em[0] = NULL; /* zero operands: lnp-tbox takes NULL */
+  v->vv[0] = NULL;
   v->Es[1] = v->Es1;
-  v->Em[1] = v->Em1;
-  v->vv[1] = v->v1;
+  v->Em[1] = NULL;
+  v->vv[1] = NULL;
 
   for (i = 0; i < NEQTOT; i++)
     {
@@ -1002,13 +1129,9 @@ fdb_verifier_init (fdb_verifier_ctx_t v, const lnp_tbox_params_t params,
       v->r0[i] = v->r0ii[i];
     }
 
-  abdlop_keygen (v->A1, v->A2prime, v->Bmat, seed, v->tbox); /* public setup */
-  polymat_urandom (v->ARmat, Rq->q, Rq->log2q, seed, 100); /* public setup */
-  polymat_urandom (v->AMmat, Rq->q, Rq->log2q, seed, 101);
-  build_equation_structure (v->R2, v->r1, v->R2ii, v->r1ii, v->ARmat,
-                            v->AMmat, Rq, v->m1, v->Z, v->l, v->n, v->n_);
-  build_norm_selectors (v->Es0, v->Em0, v->v0, v->Es1, v->Em1, v->v1, v->Ds,
-                        v->Dm, v->u);
+  fdb_public_setup (v->A1, v->A2prime, v->Bmat, v->ARmat, v->AMmat, v->R2,
+                    v->r1, v->R2ii, v->r1ii, v->Es0, v->Es1, v->Dm, v->tbox,
+                    Rq, v->m1, v->Z, v->l, v->n, v->n_, seed);
 }
 
 /* the opening equations' constant terms r0[NEQ+i] = -t_h[i], from the
@@ -1019,17 +1142,27 @@ fdb_verifier_refresh_credential_r0 (fdb_verifier_ctx_t v)
   unsigned int i;
   for (i = 0; i < NLIN; i++)
     {
-      poly_set (v->r0[NEQ + i], polyvec_get_elem (v->th, i));
-      poly_neg_self (v->r0[NEQ + i]);
+      poly_set (v->r0[NEQ + i], polyvec_get_elem (v->th, i)); /* r0 = t_h[i] */
+      poly_neg_self (v->r0[NEQ + i]); /* r0 = -t_h[i] */
     }
 }
 
-/* store the credential t_h received at issuance (public commitment to h) */
-static void
-fdb_verifier_set_credential (fdb_verifier_ctx_t v, polyvec_t th)
+/* store the credential t_h received at issuance (public commitment to h),
+ * from its serialized wire form.  Returns 1 on success, 0 on a malformed
+ * buffer. */
+static int
+fdb_verifier_set_credential (fdb_verifier_ctx_t v, const uint8_t *cred,
+                             size_t credlen)
 {
-  polyvec_set (v->th, th);
+  size_t declen;
+
+  if (!fdb_deccred (&declen, cred, v->th, v->Rq) || declen != credlen)
+    return 0;
+  /* decoded values are in the positive (redp) representation; center them */
+  polyvec_mod (v->th, v->th);
+  polyvec_redc (v->th, v->th);
   fdb_verifier_refresh_credential_r0 (v);
+  return 1;
 }
 
 /* pick a fresh random message for the wire.  The verifier chooses only the
@@ -1064,22 +1197,22 @@ fdb_verifier_verify (fdb_verifier_ctx_t v, const uint8_t *proof,
   unsigned int i;
 
   t1 = wall ();
-  b = fdb_decproof (&declen, proof, v->tA1, v->tB, v->hout, v->cpoly,
-                    v->z1, v->z21, v->hint, v->z3, v->z4, params);
+  b = fdb_decproof (&declen, proof, v->tA1, v->tB, v->hout, v->cpoly, v->z1,
+                    v->z21, v->hint, v->z3, v->z4, params);
   if (!b || declen != prooflen)
     return 0;
 
   /* r0 = -c, from c = HashToPoint(salt||msg) recomputed by the verifier */
   poly_alloc (cf, RF);
   polyvec_alloc (ciso, RP, 8);
-  derive_challenge (cc16, salt, msg, msglen);
+  derive_challenge (cc16, salt, msg, msglen); /* c = HashToPoint(salt||msg) */
   for (i = 0; i < 512; i++)
     cf64[i] = cc16[i];
-  poly_set_coeffvec_i64 (cf, cf64);
-  poly_toisoring (ciso, cf);
+  poly_set_coeffvec_i64 (cf, cf64); /* cf = c as an RF element */
+  poly_toisoring (ciso, cf);        /* ciso = iso(c) (8 RP blocks) */
   polyvec_fromcrt (ciso);
-  polyvec_redc (ciso, ciso);
-  fdb_compute_r0_public (v->r0, ciso);
+  polyvec_redc (ciso, ciso);           /* centered rep */
+  fdb_compute_r0_public (v->r0, ciso); /* r0[i] = -ciso[i], i < NEQ */
   polyvec_free (ciso);
   poly_free (cf);
 
@@ -1101,16 +1234,17 @@ fdb_verifier_verify (fdb_verifier_ctx_t v, const uint8_t *proof,
 
   memset (v->hashv, 0xff, 32);
   b = lnp_tbox_verify (v->hashv, v->hout, v->cpoly, v->z1, v->z21, v->hint,
-                       v->z3, v->z4, v->tA1, v->tB, v->A1, v->A2prime,
-                       v->Bmat, v->R2, v->r1, v->r0, NEQTOT, NULL, NULL, NULL,
-                       0, v->Es, v->Em, v->vv, NULL, NULL, NULL, v->Ds,
-                       v->Dm, v->u, params);
+                       v->z3, v->z4, v->tA1, v->tB, v->A1, v->A2prime, v->Bmat,
+                       v->R2, v->r1, v->r0, NEQTOT, NULL, NULL, NULL, 0, v->Es,
+                       v->Em, v->vv, NULL, NULL, NULL, NULL, v->Dm, NULL,
+                       params);
   t2 = wall ();
   v->t_verify = t2 - t1;
   return b;
 }
 
-/* ---- honest-run report: hash check + serialized proof size --------------- */
+/* ---- honest-run report: hash check + serialized proof size ---------------
+ */
 static int
 report_honest_result (fdb_signer_ctx_t s, fdb_verifier_ctx_t v,
                       size_t prooflen, int bres)
@@ -1131,16 +1265,20 @@ run (uint8_t seed[32], const lnp_tbox_params_t params)
   uint8_t msg[FDB_MSG_BYTES];
   uint8_t salt[FDB_SALT_BYTES];
   static uint8_t proof[FDB_PROOF_MAXLEN];
-  size_t prooflen;
+  static uint8_t cred[FDB_CRED_MAXLEN];
+  size_t prooflen, credlen;
   int bres;
 
   fdb_signer_init (signer, params, seed);
   fdb_verifier_init (verifier, params, seed);
 
-  /* issuance (once): holder computes t_h = AR*rc + AM*h and hands the
-   * PUBLIC t_h to the verifier, which stores it as the credential. */
+  /* issuance (once): holder computes t_h = AR*rc + AM*h and sends the
+   * PUBLIC t_h -- serialized, like everything crossing the boundary -- to
+   * the verifier, which stores it as the credential. */
   fdb_signer_issue (signer);
-  fdb_verifier_set_credential (verifier, signer->th);
+  fdb_enccred (cred, &credlen, signer->th, signer->Rq);
+  if (!fdb_verifier_set_credential (verifier, cred, credlen))
+    return -1;
 
   /* verifier -> wire: message */
   fdb_verifier_new_message (msg);
@@ -1148,7 +1286,7 @@ run (uint8_t seed[32], const lnp_tbox_params_t params)
   /* signer -> wire: commitment + proof + salt (r0, c, and t_h's opening are
    * NOT sent) */
   if (!fdb_signer_prove (signer, proof, &prooflen, msg, FDB_MSG_BYTES, salt,
-                         params, seed))
+                         params))
     return -1;
 
   /* honest: verify against the message the proof was made for -> accept */
@@ -1176,8 +1314,7 @@ run (uint8_t seed[32], const lnp_tbox_params_t params)
         bres = 0;
       }
     else
-      fprintf (stderr,
-               "  [OK] proof rejected under a different message\n");
+      fprintf (stderr, "  [OK] proof rejected under a different message\n");
   }
 
   /* binding to the COMMITTED KEY: verify the same proof against a TAMPERED
@@ -1190,8 +1327,9 @@ run (uint8_t seed[32], const lnp_tbox_params_t params)
     poly_ptr t0 = polyvec_get_elem (verifier->th, 0);
     INT_T (one, verifier->Rq->q->nlimbs);
     int_set_i64 (one, 1);
+    /* t_h[0] += 1  (any t_h' != t_h) */
     int_add (poly_get_coeff (t0, 0), poly_get_coeff (t0, 0), one);
-    fdb_verifier_refresh_credential_r0 (verifier);
+    fdb_verifier_refresh_credential_r0 (verifier); /* r0[NEQ+i] = -t_h'[i] */
     bad = fdb_verifier_verify (verifier, proof, prooflen, msg, FDB_MSG_BYTES,
                                salt, params);
     if (bad != 0)
@@ -1202,8 +1340,11 @@ run (uint8_t seed[32], const lnp_tbox_params_t params)
         bres = 0;
       }
     else
-      fprintf (stderr,
-               "  [OK] proof rejected under a different credential\n");
+      fprintf (stderr, "  [OK] proof rejected under a different credential\n");
+    /* restore the honest credential from its wire form -- leave the
+     * verifier reusable for any checks added after this block */
+    if (!fdb_verifier_set_credential (verifier, cred, credlen))
+      bres = 0;
   }
   return bres;
 }
