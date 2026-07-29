@@ -11,7 +11,18 @@ package lazer
 // Nonexistent -I/-L dirs are ignored, so listing both covers either prefix.
 #cgo darwin CFLAGS: -I/opt/homebrew/include -I/usr/local/include
 #cgo darwin LDFLAGS: ${SRCDIR}/liblazer.a -lm ${SRCDIR}/third_party/hexl-development/build/hexl/lib/libhexl.a -L/opt/homebrew/lib -L/usr/local/lib -lc++ -lmpfr -lgmp
-#cgo linux LDFLAGS: ${SRCDIR}/liblazer.a -lm ${SRCDIR}/third_party/hexl-development/build/hexl/lib64/libhexl.a -lstdc++ -lmpfr -lgmp
+// NB: GOOS=android also satisfies the `linux` cgo constraint, so this stanza is
+// scoped to non-android linux; Android uses the android-specific stanza below.
+#cgo linux,!android LDFLAGS: ${SRCDIR}/liblazer.a -lm ${SRCDIR}/third_party/hexl-development/build/hexl/lib64/libhexl.a -lstdc++ -lmpfr -lgmp
+// Android: the whole native stack is cross-compiled and staged per ABI by
+// scripts/build-android.sh (GMP/MPFR/HEXL/liblazer). gomobile links the final
+// .so with the C compiler driver, which does NOT pull the C++ runtime, so the
+// HEXL C++ code's runtime (libc++abi/libc++, incl. __gxx_personality_v0) must
+// be linked explicitly. All of these have interdependent symbols, so keep them
+// in one --start-group/--end-group; the static libc++ means the resulting .so
+// needs no libc++_shared.so shipped alongside it.
+#cgo android,arm64 CFLAGS: -I${SRCDIR}/android/arm64-v8a/include
+#cgo android,arm64 LDFLAGS: -Wl,--start-group ${SRCDIR}/android/arm64-v8a/lib/liblazer.a ${SRCDIR}/android/arm64-v8a/lib/libhexl.a ${SRCDIR}/android/arm64-v8a/lib/libmpfr.a ${SRCDIR}/android/arm64-v8a/lib/libgmp.a -lc++_static -lc++abi -Wl,--end-group -lm
 
 #include <gmp.h>
 #include <mpfr.h>

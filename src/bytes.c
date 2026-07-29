@@ -7,6 +7,37 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Bionic only declares/exports getentropy(2) from API level 28 onward. When
+ * building for an older Android platform, fall back to /dev/urandom (always
+ * available) so the library links and runs on API < 28 devices. */
+#if defined(__ANDROID__) && defined(__ANDROID_API__) && __ANDROID_API__ < 28
+#include <errno.h>
+#include <fcntl.h>
+static int
+_lazer_getentropy (void *buf, size_t n)
+{
+  int fd = open ("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return -1;
+  size_t off = 0;
+  while (off < n)
+    {
+      ssize_t r = read (fd, (uint8_t *)buf + off, n - off);
+      if (r <= 0)
+        {
+          if (r < 0 && errno == EINTR)
+            continue;
+          close (fd);
+          return -1;
+        }
+      off += (size_t)r;
+    }
+  close (fd);
+  return 0;
+}
+#define getentropy _lazer_getentropy
+#endif
+
 static inline int ishexdigit (const int);
 static inline uint8_t hexdigit2bits (int);
 static int bits2hexdigit (uint8_t);

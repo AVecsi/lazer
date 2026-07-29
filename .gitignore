@@ -59,3 +59,10 @@ third_party/hexl-development/
 docs/build/*
 
 python/_cstruc_ffi.c
+
+# Android cross-build (scripts/build-android.sh)
+#   android/       staged per-ABI libs + headers the cgo binding links against
+#   build-android/ scratch: downloaded GMP/MPFR tarballs, extracted sources,
+#                  object files, and the HEXL cmake build tree
+android/
+build-android/
