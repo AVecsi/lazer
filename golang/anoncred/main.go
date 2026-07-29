@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"XXX1.org/lazer"
+	"github.com/AVecsi/lazer"
 )
 
 // Tiered Option C / IRMA-fit demo. The message blocks are the user's secret

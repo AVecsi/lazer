@@ -9,7 +9,7 @@ package main
 import (
 	"testing"
 
-	"XXX1.org/lazer"
+	"github.com/AVecsi/lazer"
 )
 
 // runOnceCommit performs a full honest run via the stateless API at a tier.

@@ -6,12 +6,12 @@ package lazer
 // helpers (lazer-in2.h limbs_*) hit optimization-sensitive UB that miscompiles
 // for the larger proof parameters (e.g. the largest anoncred tier), crashing at
 // run time. Build this TU at the library's optimization level. See CLAUDE.md.
-#cgo CFLAGS: -O2 -g -Wall -Wextra -I${SRCDIR}/../.. -I${SRCDIR}/../../src
+#cgo CFLAGS: -O2 -g -Wall -Wextra -I${SRCDIR} -I${SRCDIR}/src
 // Homebrew: /opt/homebrew on Apple Silicon, /usr/local on Intel Macs.
 // Nonexistent -I/-L dirs are ignored, so listing both covers either prefix.
 #cgo darwin CFLAGS: -I/opt/homebrew/include -I/usr/local/include
-#cgo darwin LDFLAGS: ${SRCDIR}/../../liblazer.a -lm ${SRCDIR}/../../third_party/hexl-development/build/hexl/lib/libhexl.a -L/opt/homebrew/lib -L/usr/local/lib -lc++ -lmpfr -lgmp
-#cgo linux LDFLAGS: ${SRCDIR}/../../liblazer.a -lm ${SRCDIR}/../../third_party/hexl-development/build/hexl/lib64/libhexl.a -lstdc++ -lmpfr -lgmp
+#cgo darwin LDFLAGS: ${SRCDIR}/liblazer.a -lm ${SRCDIR}/third_party/hexl-development/build/hexl/lib/libhexl.a -L/opt/homebrew/lib -L/usr/local/lib -lc++ -lmpfr -lgmp
+#cgo linux LDFLAGS: ${SRCDIR}/liblazer.a -lm ${SRCDIR}/third_party/hexl-development/build/hexl/lib64/libhexl.a -lstdc++ -lmpfr -lgmp
 
 #include <gmp.h>
 #include <mpfr.h>

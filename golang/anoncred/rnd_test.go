@@ -12,7 +12,7 @@ import (
 	"math/big"
 	"testing"
 
-	"XXX1.org/lazer"
+	"github.com/AVecsi/lazer"
 )
 
 func randInt(t *testing.T, n int) int {

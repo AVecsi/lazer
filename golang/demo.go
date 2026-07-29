@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"XXX1.org/lazer"
+	"github.com/AVecsi/lazer"
 )
 
 func main() {
