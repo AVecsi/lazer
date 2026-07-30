@@ -1,9 +1,9 @@
 --- a/hexl/util/cpu-features.hpp
 +++ b/hexl/util/cpu-features.hpp
 @@ -7,11 +7,20 @@
- 
+
  #include <cstdlib>
- 
+
 +#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) \
 +    || defined(_M_IX86)
 +#define HEXL_CPU_X86 1
@@ -12,10 +12,10 @@
 +#ifdef HEXL_CPU_X86
  #include "cpuinfo_x86.h"  // NOLINT(build/include_subdir)
 +#endif
- 
+
  namespace intel {
  namespace hexl {
- 
+
 +#ifdef HEXL_CPU_X86
 +
  // Use to disable avx512 dispatching at runtime
@@ -24,7 +24,7 @@
 @@ -31,5 +40,14 @@
  static const bool has_avx512vbmi2 =
      features.avx512vbmi2 && !disable_avx512vbmi2;
- 
+
 +#else
 +
 +// Non-x86 targets (e.g. arm64): no AVX512, always use native implementations.
@@ -39,36 +39,47 @@
 --- a/hexl/eltwise/eltwise-cmp-sub-mod-avx512.hpp
 +++ b/hexl/eltwise/eltwise-cmp-sub-mod-avx512.hpp
 @@ -3,7 +3,9 @@
- 
+
  #pragma once
- 
+
 +#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
  #include <immintrin.h>
 +#endif
  #include <stdint.h>
- 
+
  #include "eltwise/eltwise-cmp-sub-mod-internal.hpp"
 --- a/hexl/ntt/ntt-avx512-util.hpp
 +++ b/hexl/ntt/ntt-avx512-util.hpp
 @@ -3,7 +3,9 @@
- 
+
  #pragma once
- 
+
 +#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
  #include <immintrin.h>
 +#endif
- 
+
  #include <functional>
  #include <vector>
 --- a/hexl/util/avx512-util.hpp
 +++ b/hexl/util/avx512-util.hpp
 @@ -3,7 +3,9 @@
- 
+
  #pragma once
- 
+
 +#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
  #include <immintrin.h>
 +#endif
- 
+
  #include <vector>
- 
+
+--- a/hexl/CMakeLists.txt
++++ b/hexl/CMakeLists.txt
+@@ -94,6 +94,7 @@
+ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+     target_compile_options(hexl PRIVATE -Wall -Wconversion -Wshadow -pedantic -Wextra
+-        -Wno-unknown-pragmas -march=native -O3 -fomit-frame-pointer
++        -Wno-unknown-pragmas -O3 -fomit-frame-pointer
++        $<$<NOT:$<BOOL:${CMAKE_CROSSCOMPILING}>>:-march=native>
+         -Wno-sign-conversion
+         -Wno-implicit-int-conversion
+     )

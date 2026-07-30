@@ -11,7 +11,24 @@ package lazer
 // Nonexistent -I/-L dirs are ignored, so listing both covers either prefix.
 #cgo darwin CFLAGS: -I/opt/homebrew/include -I/usr/local/include
 #cgo darwin LDFLAGS: ${SRCDIR}/../../liblazer.a -lm ${SRCDIR}/../../third_party/hexl-development/build/hexl/lib/libhexl.a -L/opt/homebrew/lib -L/usr/local/lib -lc++ -lmpfr -lgmp
-#cgo linux LDFLAGS: ${SRCDIR}/../../liblazer.a -lm ${SRCDIR}/../../third_party/hexl-development/build/hexl/lib64/libhexl.a -lstdc++ -lmpfr -lgmp
+// cgo treats GOOS=android as also matching a bare "linux" constraint (shared
+// kernel), so without the "!android" exclusion here this line's -lstdc++ and
+// its (nonexistent on our Android cross build) lib64/libhexl.a path get
+// concatenated onto the #cgo android line below rather than replaced by it.
+#cgo linux,!android LDFLAGS: ${SRCDIR}/../../liblazer.a -lm ${SRCDIR}/../../third_party/hexl-development/build/hexl/lib64/libhexl.a -lstdc++ -lmpfr -lgmp
+// gmp/mpfr/libc++/libc++abi all have to be linked as STATIC archives here,
+// not via -lgmp/-lmpfr/-static-libstdc++: gomobile's .aar only bundles
+// libgojni.so itself, so any shared dependency it NEEDs beyond Android's own
+// system libs (libgmp.so, libmpfr.so, libc++_shared.so, ...) produces a
+// `dlopen failed: library not found` crash at runtime with no automatic fix
+// on the app/Gradle side. (`-static-libstdc++` alone was tried first -- NDK
+// clang does accept it, but it left __gxx_personality_v0, part of
+// libc++abi's exception-handling support, as an unresolved dynamic symbol;
+// linking libc++_static.a + libc++abi.a explicitly, in that order, is what
+// actually pulls both in fully.) The caller (irmamobile's bind_go.sh /
+// lazer's flake.nix android-tools devShell) passes every one of these
+// archives' exact paths via CGO_LDFLAGS -- nothing is listed here for them.
+#cgo android LDFLAGS: ${SRCDIR}/../../liblazer.a -lm ${SRCDIR}/../../third_party/hexl-development/build/hexl/lib/libhexl.a
 
 #include <gmp.h>
 #include <mpfr.h>

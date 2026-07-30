@@ -52,7 +52,7 @@ B = [sqrt(34034726), sqrt(16*64)]
 # psi*||h||_2 (the h rows then dominate Bprime), but inflates Bprime and so
 # k's bound, eating the wrap-free margin.  FSCALE = 64 already makes the h
 # rows dominate the l2 budget (the k term is < 2% of Bprime).
-# Keep FSCALE/Bprime in sync with FDB_FSCALE/FDB_BPRIME in fdb-test.c.
+# Keep FSCALE/Bprime in sync with FDB_FSCALE (and the Bprime budget) in fdb.c.
 FSCALE = 64
 Bh2 = sqrt(512) * 6144                               # worst-case ||h||_2
 Kinf = (sqrt(34034726) * Bh2 + 6144 + 6144) / 12289  # worst-case |k|_inf

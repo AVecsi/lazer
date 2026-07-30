@@ -1,3 +1,3 @@
-module XXX1.org/lazer
+module github.com/AVecsi/lazer
 
 go 1.19
