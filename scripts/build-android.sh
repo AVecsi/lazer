@@ -92,6 +92,32 @@ fetch() { # url dest
   curl -fL --retry 3 -o "$2" "$1"
 }
 
+# The extracted+patched third_party trees and the generated lazer.h are build
+# products, so they are gitignored and absent from a fresh clone / the Go module
+# cache (only the .zips are committed). Recreate them exactly as the Makefile's
+# $(FALCON_DIR) / $(HEXL_DIR) / lazer.h rules do -- but without HEXL's host cmake
+# build, since we cross-build HEXL ourselves into a separate tree.
+prepare_sources() {
+  local tp="$ROOT/third_party"
+
+  if [[ ! -d "$tp/Falcon-impl-20211101" ]]; then
+    log "unpacking Falcon-impl-20211101 ..."
+    ( cd "$tp" && unzip -q Falcon-impl-20211101.zip )
+    patch -s -d "$tp/Falcon-impl-20211101" -p1 < "$ROOT/src/falcon.patch"
+  fi
+
+  if [[ ! -d "$tp/hexl-development" ]]; then
+    log "unpacking hexl-development ..."
+    ( cd "$tp" && unzip -q hexl-development.zip )
+    patch -s -d "$tp/hexl-development" -p1 < "$ROOT/src/hexl.patch"
+  fi
+
+  if [[ ! -f "$ROOT/lazer.h" ]]; then
+    log "generating lazer.h ..."
+    ( cd "$ROOT" && make lazer.h )
+  fi
+}
+
 build_abi() {
   local target="$1" abi triple clangpfx
   read -r abi triple clangpfx <<<"$(abi_triple "$target")"
@@ -145,7 +171,7 @@ build_abi() {
   # Reuse the already-unzipped + patched host source tree; separate build dir.
   local HEXL_SRC="$ROOT/third_party/hexl-development"
   local HEXL_BUILD="$BUILD/$abi/hexl"
-  [[ -d "$HEXL_SRC" ]] || { echo "error: HEXL source missing ($HEXL_SRC); run host 'make' once first" >&2; exit 1; }
+  [[ -d "$HEXL_SRC" ]] || { echo "error: HEXL source missing ($HEXL_SRC) after prepare_sources" >&2; exit 1; }
   if [[ $FORCE -eq 1 || ! -f "$PREFIX/lib/libhexl.a" ]]; then
     # HEXL's hexl_create_archive() bundles libcpu_features.a into libhexl.a with
     # a POST_BUILD step that calls a hardcoded `ar` (not ${CMAKE_AR}). On a macOS
@@ -180,7 +206,6 @@ build_abi() {
   # LaBRADOR, no -march=native), compiled straight into a scratch dir so the
   # host artifacts in the tree are never clobbered.
   if [[ $FORCE -eq 1 || ! -f "$PREFIX/lib/liblazer.a" ]]; then
-    [[ -f "$ROOT/lazer.h" ]] || ( cd "$ROOT" && make lazer.h )
     local FALCON="$ROOT/third_party/Falcon-impl-20211101"
     local HEXL_INC="$HEXL_SRC/hexl/include"
     local CFLAGS="-O3 -g -Wall -Wextra -fomit-frame-pointer -DNDEBUG -DFALCON_FPNATIVE"
@@ -221,6 +246,8 @@ build_abi() {
   [[ $missing -eq 0 ]] || exit 1
   log "OK: $abi complete -> $PREFIX"
 }
+
+prepare_sources
 
 IFS=',' read -ra _targets <<<"$TARGETS"
 built_any=0
